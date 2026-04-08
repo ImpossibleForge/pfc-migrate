@@ -389,6 +389,280 @@ def s3_convert_file(
         return {**stats, "s3_key": key, "s3_out_key": out_key}
 
 
+# ---------------------------------------------------------------------------
+# Azure Blob Storage support (Stage 3)
+# ---------------------------------------------------------------------------
+
+def _azure_client(args):
+    """Create Azure BlobServiceClient."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError:
+        print("ERROR: azure-storage-blob required: pip install azure-storage-blob", file=sys.stderr)
+        sys.exit(1)
+    conn = getattr(args, "connection_string", None)
+    url  = getattr(args, "account_url", None)
+    if conn:
+        return BlobServiceClient.from_connection_string(conn)
+    if url:
+        return BlobServiceClient(account_url=url)
+    print("ERROR: --connection-string or --account-url required for Azure.", file=sys.stderr)
+    sys.exit(1)
+
+
+def azure_convert_file(
+    client,
+    container: str,
+    blob_name: str,
+    out_container: str,
+    out_prefix: str,
+    pfc_binary: str,
+    fmt: str = None,
+    verbose: bool = False,
+    delete_original: bool = False,
+) -> dict:
+    """Download one Azure blob, convert to PFC, upload back."""
+    src_path = Path(blob_name)
+    fmt = fmt or detect_format(src_path)
+    if not fmt:
+        raise ValueError(f"Cannot detect format for '{blob_name}'. Use --format.")
+
+    out_name = output_path_for(src_path).name
+    out_blob = (out_prefix.rstrip("/") + "/" + out_name) if out_prefix else out_name
+
+    if verbose:
+        print(f"  → azure://{container}/{blob_name}  [{fmt}]")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_input = Path(tmpdir) / src_path.name
+        tmp_pfc   = Path(tmpdir) / out_name
+
+        # Download
+        if verbose:
+            print(f"     Downloading ...", end=" ", flush=True)
+        blob_client = client.get_blob_client(container=container, blob=blob_name)
+        with open(tmp_input, "wb") as f:
+            f.write(blob_client.download_blob().readall())
+        if verbose:
+            print(f"{tmp_input.stat().st_size/1_048_576:.1f} MB")
+
+        # Convert
+        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        pfc_mb = tmp_pfc.stat().st_size / 1_048_576
+
+        # Upload .pfc
+        if verbose:
+            print(f"     Uploading  azure://{out_container}/{out_blob} ...", end=" ", flush=True)
+        out_client = client.get_blob_client(container=out_container, blob=out_blob)
+        with open(tmp_pfc, "rb") as f:
+            out_client.upload_blob(f, overwrite=True)
+        if verbose:
+            print(f"{pfc_mb:.1f} MB")
+
+        # Upload .bidx
+        bidx_local = Path(str(tmp_pfc) + ".bidx")
+        if bidx_local.exists():
+            bidx_blob = out_blob + ".bidx"
+            bc = client.get_blob_client(container=out_container, blob=bidx_blob)
+            with open(bidx_local, "rb") as f:
+                bc.upload_blob(f, overwrite=True)
+            if verbose:
+                print(f"     Uploading  azure://{out_container}/{bidx_blob}  (index)")
+
+        if delete_original:
+            blob_client.delete_blob()
+            if verbose:
+                print(f"     Deleted    azure://{container}/{blob_name}")
+
+        ratio = pfc_mb / stats["decompressed_mb"] * 100 if stats["decompressed_mb"] > 0 else 0
+        if verbose:
+            print(f"     Done: {stats['decompressed_mb']:.1f} MB → pfc {pfc_mb:.1f} MB ({ratio:.1f}%)  ✓")
+
+        return {**stats, "blob": blob_name, "out_blob": out_blob}
+
+
+def cmd_azure(args, pfc_binary: str):
+    """Handle the `azure` subcommand."""
+    client = _azure_client(args)
+    out_container = getattr(args, "out_container", None) or args.container
+    out_prefix    = getattr(args, "out_prefix", None)    or getattr(args, "prefix", "")
+
+    if args.blob:
+        try:
+            azure_convert_file(
+                client, args.container, args.blob,
+                out_container, out_prefix,
+                pfc_binary, fmt=args.format, verbose=True,
+                delete_original=args.delete,
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        cc = client.get_container_client(args.container)
+        blobs = [b.name for b in cc.list_blobs(name_starts_with=args.prefix or "")]
+        if args.format:
+            blobs = [b for b in blobs if b.lower().endswith(f".{args.format}") or
+                     b.lower().endswith(f".jsonl.{args.format}")]
+        if not blobs:
+            print("No matching blobs found.")
+            sys.exit(0)
+        print(f"Found {len(blobs)} blob(s)\n")
+        success = failed = 0
+        for blob in blobs:
+            try:
+                azure_convert_file(
+                    client, args.container, blob,
+                    out_container, out_prefix,
+                    pfc_binary, fmt=args.format,
+                    verbose=args.verbose, delete_original=args.delete,
+                )
+                success += 1
+            except Exception as exc:
+                print(f"  ERROR {blob}: {exc}", file=sys.stderr)
+                failed += 1
+        print(f"\nDone: {success} converted, {failed} failed")
+        sys.exit(0 if failed == 0 else 1)
+
+
+# ---------------------------------------------------------------------------
+# Google Cloud Storage support (Stage 3)
+# ---------------------------------------------------------------------------
+
+def _gcs_client(args):
+    """Create GCS client."""
+    try:
+        from google.cloud import storage as gcs_mod
+    except ImportError:
+        print("ERROR: google-cloud-storage required: pip install google-cloud-storage", file=sys.stderr)
+        sys.exit(1)
+    endpoint = getattr(args, "endpoint_url", None)
+    if endpoint:
+        # Custom endpoint (fake-gcs-server)
+        import requests
+        from google.auth.credentials import AnonymousCredentials
+        client = gcs_mod.Client(
+            credentials=AnonymousCredentials(),
+            project="test-project",
+            client_options={"api_endpoint": endpoint},
+        )
+        # Disable SSL verification for local emulator
+        client._http.verify = False
+        return client
+    return gcs_mod.Client()
+
+
+def gcs_convert_file(
+    client,
+    bucket_name: str,
+    blob_name: str,
+    out_bucket_name: str,
+    out_prefix: str,
+    pfc_binary: str,
+    fmt: str = None,
+    verbose: bool = False,
+    delete_original: bool = False,
+) -> dict:
+    """Download one GCS object, convert to PFC, upload back."""
+    src_path = Path(blob_name)
+    fmt = fmt or detect_format(src_path)
+    if not fmt:
+        raise ValueError(f"Cannot detect format for '{blob_name}'. Use --format.")
+
+    out_name = output_path_for(src_path).name
+    out_blob_name = (out_prefix.rstrip("/") + "/" + out_name) if out_prefix else out_name
+
+    if verbose:
+        print(f"  → gcs://{bucket_name}/{blob_name}  [{fmt}]")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_input = Path(tmpdir) / src_path.name
+        tmp_pfc   = Path(tmpdir) / out_name
+
+        # Download
+        if verbose:
+            print(f"     Downloading ...", end=" ", flush=True)
+        bucket = client.bucket(bucket_name)
+        bucket.blob(blob_name).download_to_filename(str(tmp_input))
+        if verbose:
+            print(f"{tmp_input.stat().st_size/1_048_576:.1f} MB")
+
+        # Convert
+        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        pfc_mb = tmp_pfc.stat().st_size / 1_048_576
+
+        # Upload .pfc
+        if verbose:
+            print(f"     Uploading  gcs://{out_bucket_name}/{out_blob_name} ...", end=" ", flush=True)
+        out_bucket = client.bucket(out_bucket_name)
+        out_bucket.blob(out_blob_name).upload_from_filename(str(tmp_pfc))
+        if verbose:
+            print(f"{pfc_mb:.1f} MB")
+
+        # Upload .bidx
+        bidx_local = Path(str(tmp_pfc) + ".bidx")
+        if bidx_local.exists():
+            bidx_blob = out_blob_name + ".bidx"
+            out_bucket.blob(bidx_blob).upload_from_filename(str(bidx_local))
+            if verbose:
+                print(f"     Uploading  gcs://{out_bucket_name}/{bidx_blob}  (index)")
+
+        if delete_original:
+            bucket.blob(blob_name).delete()
+            if verbose:
+                print(f"     Deleted    gcs://{bucket_name}/{blob_name}")
+
+        ratio = pfc_mb / stats["decompressed_mb"] * 100 if stats["decompressed_mb"] > 0 else 0
+        if verbose:
+            print(f"     Done: {stats['decompressed_mb']:.1f} MB → pfc {pfc_mb:.1f} MB ({ratio:.1f}%)  ✓")
+
+        return {**stats, "blob": blob_name, "out_blob": out_blob_name}
+
+
+def cmd_gcs(args, pfc_binary: str):
+    """Handle the `gcs` subcommand."""
+    client = _gcs_client(args)
+    out_bucket = getattr(args, "out_bucket", None) or args.bucket
+    out_prefix = getattr(args, "out_prefix", None) or getattr(args, "prefix", "")
+
+    if args.blob:
+        try:
+            gcs_convert_file(
+                client, args.bucket, args.blob,
+                out_bucket, out_prefix,
+                pfc_binary, fmt=args.format, verbose=True,
+                delete_original=args.delete,
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        bucket = client.bucket(args.bucket)
+        blobs = [b.name for b in client.list_blobs(args.bucket, prefix=args.prefix or "")]
+        if args.format:
+            blobs = [b for b in blobs if b.lower().endswith(f".{args.format}") or
+                     b.lower().endswith(f".jsonl.{args.format}")]
+        if not blobs:
+            print("No matching objects found.")
+            sys.exit(0)
+        print(f"Found {len(blobs)} object(s)\n")
+        success = failed = 0
+        for blob in blobs:
+            try:
+                gcs_convert_file(
+                    client, args.bucket, blob,
+                    out_bucket, out_prefix,
+                    pfc_binary, fmt=args.format,
+                    verbose=args.verbose, delete_original=args.delete,
+                )
+                success += 1
+            except Exception as exc:
+                print(f"  ERROR {blob}: {exc}", file=sys.stderr)
+                failed += 1
+        print(f"\nDone: {success} converted, {failed} failed")
+        sys.exit(0 if failed == 0 else 1)
+
+
 def cmd_s3(args, pfc_binary: str):
     """Handle the `s3` subcommand."""
     s3 = _s3_client(args)
@@ -608,6 +882,35 @@ Install pfc_jsonl binary first:
     conv.add_argument("--recursive", "-r", action="store_true", help="Recurse into subdirectories")
     _add_common(conv)
 
+    # ---- azure (Stage 3 — Azure Blob Storage) ----
+    def _add_azure_common(p):
+        p.add_argument("--container",         required=True, help="Source container name")
+        p.add_argument("--blob",              default=None,  help="Single blob name (omit for batch)")
+        p.add_argument("--prefix",            default="",    help="Blob prefix for batch mode")
+        p.add_argument("--out-container",     default=None,  help="Destination container (default: same)")
+        p.add_argument("--out-prefix",        default=None,  help="Destination prefix")
+        p.add_argument("--connection-string", default=None,  help="Azure Storage connection string")
+        p.add_argument("--account-url",       default=None,  help="Azure Storage account URL")
+        p.add_argument("--delete",            action="store_true", help="Delete original blob after conversion")
+        _add_common(p)
+
+    azp = sub.add_parser("azure", help="Convert Azure Blob Storage objects (gzip/zstd/bzip2/lz4 → pfc)")
+    _add_azure_common(azp)
+
+    # ---- gcs (Stage 3 — Google Cloud Storage) ----
+    def _add_gcs_common(p):
+        p.add_argument("--bucket",       required=True, help="Source GCS bucket name")
+        p.add_argument("--blob",         default=None,  help="Single object name (omit for batch)")
+        p.add_argument("--prefix",       default="",    help="Object prefix for batch mode")
+        p.add_argument("--out-bucket",   default=None,  help="Destination bucket (default: same)")
+        p.add_argument("--out-prefix",   default=None,  help="Destination prefix")
+        p.add_argument("--endpoint-url", default=None,  help="Custom GCS endpoint (e.g. fake-gcs: http://localhost:4443)")
+        p.add_argument("--delete",       action="store_true", help="Delete original object after conversion")
+        _add_common(p)
+
+    gcsp = sub.add_parser("gcs", help="Convert Google Cloud Storage objects (gzip/zstd/bzip2/lz4 → pfc)")
+    _add_gcs_common(gcsp)
+
     # ---- s3 (Stage 2 — Amazon S3) ----
     def _add_s3_common(p):
         p.add_argument("--bucket",      required=True, help="Source S3 bucket name")
@@ -671,6 +974,16 @@ def main():
     # ---- glacier command ----
     if args.command == "glacier":
         cmd_glacier(args, pfc_binary)
+        return
+
+    # ---- azure command ----
+    if args.command == "azure":
+        cmd_azure(args, pfc_binary)
+        return
+
+    # ---- gcs command ----
+    if args.command == "gcs":
+        cmd_gcs(args, pfc_binary)
         return
 
     # ---- convert command ----
