@@ -1,31 +1,32 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfc-migrate"
-version = "0.1.0"
-description = "Convert compressed JSONL archives (gzip, zstd, bzip2, lz4) to PFC format"
+version = "0.3.0"
+description = "Convert compressed JSONL archives (gzip, zstd, bzip2, lz4) to PFC format — local, S3, Azure, GCS"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.8"
-keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration"]
+keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Topic :: System :: Logging",
     "Topic :: Utilities",
 ]
 
 # Core deps: nothing (gzip + bz2 are stdlib)
-# Optional deps for zstd and lz4
 dependencies = []
 
 [project.optional-dependencies]
-zstd = ["zstandard>=0.21"]
-lz4  = ["lz4>=4.0"]
-all  = ["zstandard>=0.21", "lz4>=4.0"]
+zstd  = ["zstandard>=0.21"]
+lz4   = ["lz4>=4.0"]
+s3    = ["boto3>=1.26"]
+azure = ["azure-storage-blob>=12.9.0"]
+gcs   = ["google-cloud-storage>=2.0"]
+all   = ["zstandard>=0.21", "lz4>=4.0", "boto3>=1.26", "azure-storage-blob>=12.9.0", "google-cloud-storage>=2.0"]
 
 [project.scripts]
 pfc-migrate = "pfc_migrate:main"
@@ -33,3 +34,6 @@ pfc-migrate = "pfc_migrate:main"
 [project.urls]
 Homepage   = "https://github.com/ImpossibleForge/pfc-migrate"
 Repository = "https://github.com/ImpossibleForge/pfc-migrate"
+
+[tool.setuptools]
+py-modules = ["pfc_migrate"]

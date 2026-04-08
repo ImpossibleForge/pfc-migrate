@@ -4,9 +4,9 @@ pfc-migrate — Convert compressed JSONL archives to PFC format.
 
 Supports:
   Input formats : gzip (.gz), zstd (.zst), bzip2 (.bz2), lz4 (.lz4), plain JSONL
-  Storage       : Local filesystem (Stage 1)
-                  S3 / S3 Glacier   (Stage 2) ← NEW
-                  Azure / GCS       (Stage 3, planned)
+  Storage       : Local filesystem  (Stage 1) ✅
+                  S3 / S3 Glacier   (Stage 2) ✅
+                  Azure Blob / GCS  (Stage 3) ✅
 
 Usage:
   pfc-migrate convert logs.jsonl.gz  logs.pfc
