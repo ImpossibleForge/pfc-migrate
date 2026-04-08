@@ -181,23 +181,28 @@ def convert_file(
                 f"pfc_jsonl compress failed (exit {result.returncode}):\n{result.stderr.strip()}"
             )
 
-        # Stats
-        input_mb  = input_path.stat().st_size  / 1_048_576
-        output_mb = output_path.stat().st_size / 1_048_576
-        ratio_pct = (output_mb / input_mb * 100) if input_mb > 0 else 0.0
+        # Stats — compare PFC to the decompressed (original) size for honest ratio
+        compressed_mb   = input_path.stat().st_size      / 1_048_576
+        decompressed_mb = Path(tmp_path).stat().st_size  / 1_048_576  # size before PFC
+        output_mb       = output_path.stat().st_size     / 1_048_576
+        ratio_pct       = (output_mb / decompressed_mb * 100) if decompressed_mb > 0 else 0.0
 
         if verbose:
+            fmt_label = f" [{fmt}]" if fmt != "plain" else ""
             print(
-                f"     {input_mb:.1f} MB → {output_mb:.1f} MB  "
-                f"({ratio_pct:.1f}% of input)  ✓ {output_path.name}"
+                f"     original {decompressed_mb:.1f} MB"
+                f"  →  {fmt}{fmt_label} {compressed_mb:.1f} MB"
+                f"  →  pfc {output_mb:.1f} MB"
+                f"  ({ratio_pct:.1f}% of original)  ✓ {output_path.name}"
             )
 
         return {
-            "input":      str(input_path),
-            "output":     str(output_path),
-            "input_mb":   input_mb,
-            "output_mb":  output_mb,
-            "ratio_pct":  ratio_pct,
+            "input":           str(input_path),
+            "output":          str(output_path),
+            "compressed_mb":   compressed_mb,
+            "decompressed_mb": decompressed_mb,
+            "output_mb":       output_mb,
+            "ratio_pct":       ratio_pct,
         }
 
     finally:
@@ -247,15 +252,15 @@ def convert_dir(
 
     print(f"Found {len(files)} file(s) to convert\n")
 
-    total_in_mb = total_out_mb = 0.0
+    total_decompressed_mb = total_out_mb = 0.0
     success = failed = 0
 
     for f in files:
         out = output_path_for(f, output_dir)
         try:
             stats = convert_file(f, out, pfc_binary, fmt=fmt, verbose=verbose)
-            total_in_mb  += stats["input_mb"]
-            total_out_mb += stats["output_mb"]
+            total_decompressed_mb += stats["decompressed_mb"]
+            total_out_mb          += stats["output_mb"]
             success += 1
         except Exception as exc:
             print(f"  ERROR {f.name}: {exc}", file=sys.stderr)
@@ -263,13 +268,13 @@ def convert_dir(
 
     # Summary
     if success:
-        overall_ratio = (total_out_mb / total_in_mb * 100) if total_in_mb > 0 else 0
-        saved_mb = total_in_mb - total_out_mb
+        overall_ratio = (total_out_mb / total_decompressed_mb * 100) if total_decompressed_mb > 0 else 0
+        saved_mb = total_decompressed_mb - total_out_mb
         print(
             f"\nDone: {success} converted, {failed} failed\n"
-            f"  Input  : {total_in_mb:.1f} MB\n"
-            f"  Output : {total_out_mb:.1f} MB  ({overall_ratio:.1f}% of input)\n"
-            f"  Saved  : {saved_mb:.1f} MB"
+            f"  Original (decompressed) : {total_decompressed_mb:.1f} MB\n"
+            f"  PFC output              : {total_out_mb:.1f} MB  ({overall_ratio:.1f}% of original)\n"
+            f"  Saved vs original       : {saved_mb:.1f} MB"
         )
     else:
         print(f"\nDone: 0 converted, {failed} failed")
