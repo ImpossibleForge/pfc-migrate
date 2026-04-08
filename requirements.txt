@@ -1,0 +1,8 @@
+# Core: no extra dependencies (gzip + bz2 are Python stdlib)
+
+# Optional — install what you need:
+# zstandard>=0.21   # for .zst files
+# lz4>=4.0          # for .lz4 files
+
+# Install all optional deps at once:
+# pip install pfc-migrate[all]

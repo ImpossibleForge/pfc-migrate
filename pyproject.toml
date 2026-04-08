@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pfc-migrate"
+version = "0.1.0"
+description = "Convert compressed JSONL archives (gzip, zstd, bzip2, lz4) to PFC format"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Logging",
+    "Topic :: Utilities",
+]
+
+# Core deps: nothing (gzip + bz2 are stdlib)
+# Optional deps for zstd and lz4
+dependencies = []
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.21"]
+lz4  = ["lz4>=4.0"]
+all  = ["zstandard>=0.21", "lz4>=4.0"]
+
+[project.scripts]
+pfc-migrate = "pfc_migrate:main"
+
+[project.urls]
+Homepage   = "https://github.com/ImpossibleForge/pfc-migrate"
+Repository = "https://github.com/ImpossibleForge/pfc-migrate"
