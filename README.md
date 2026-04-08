@@ -256,6 +256,6 @@ The [full test suite](test_all_backends.py) verifies 4 backends × 4 formats wit
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/ImpossibleForge/pfc-migrate/blob/main/LICENSE).
 
 *Built by [ImpossibleForge](https://github.com/ImpossibleForge)*
