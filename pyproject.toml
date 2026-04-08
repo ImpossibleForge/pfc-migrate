@@ -1,17 +1,18 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=68,<77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfc-migrate"
-version = "0.3.0"
+version = "0.3.1"
 description = "Convert compressed JSONL archives (gzip, zstd, bzip2, lz4) to PFC format — local, S3, Azure, GCS"
 readme = "README.md"
-license = "MIT"
+license = { text = "MIT" }
 requires-python = ">=3.8"
 keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Topic :: System :: Logging",
     "Topic :: Utilities",
