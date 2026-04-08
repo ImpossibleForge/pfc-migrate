@@ -5,7 +5,8 @@ pfc-migrate — Convert compressed JSONL archives to PFC format.
 Supports:
   Input formats : gzip (.gz), zstd (.zst), bzip2 (.bz2), lz4 (.lz4), plain JSONL
   Storage       : Local filesystem (Stage 1)
-                  S3 / Glacier / Azure / GCS (Stage 2+)
+                  S3 / S3 Glacier   (Stage 2) ← NEW
+                  Azure / GCS       (Stage 3, planned)
 
 Usage:
   pfc-migrate convert logs.jsonl.gz  logs.pfc
@@ -283,6 +284,271 @@ def convert_dir(
 
 
 # ---------------------------------------------------------------------------
+# S3 / Glacier support (Stage 2)
+# ---------------------------------------------------------------------------
+
+def _s3_client(args):
+    """Create a boto3 S3 client from CLI args."""
+    try:
+        import boto3
+    except ImportError:
+        print("ERROR: boto3 required for S3 support: pip install boto3", file=sys.stderr)
+        sys.exit(1)
+
+    kwargs = dict(region_name=args.region)
+    if args.endpoint_url:
+        kwargs["endpoint_url"] = args.endpoint_url
+    if args.access_key:
+        kwargs["aws_access_key_id"]     = args.access_key
+        kwargs["aws_secret_access_key"] = args.secret_key
+
+    return boto3.client("s3", **kwargs)
+
+
+def s3_list_objects(s3, bucket: str, prefix: str) -> list:
+    """List all objects under bucket/prefix. Returns list of keys."""
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+
+def s3_convert_file(
+    s3,
+    bucket: str,
+    key: str,
+    out_bucket: str,
+    out_prefix: str,
+    pfc_binary: str,
+    fmt: str = None,
+    verbose: bool = False,
+    delete_original: bool = False,
+) -> dict:
+    """
+    Download one S3 object, convert to PFC, upload back.
+    Returns stats dict or raises on error.
+    """
+    src_path = Path(key)
+    fmt = fmt or detect_format(src_path)
+    if not fmt:
+        raise ValueError(f"Cannot detect format for '{key}'. Use --format.")
+
+    # Derive output key
+    out_name = output_path_for(src_path).name          # e.g. logs.pfc
+    out_key  = (out_prefix.rstrip("/") + "/" + out_name) if out_prefix else out_name
+
+    if verbose:
+        print(f"  → s3://{bucket}/{key}  [{fmt}]")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_input  = Path(tmpdir) / src_path.name
+        tmp_pfc    = Path(tmpdir) / out_name
+
+        # 1 — Download
+        if verbose:
+            print(f"     Downloading ...", end=" ", flush=True)
+        s3.download_file(bucket, key, str(tmp_input))
+        input_mb = tmp_input.stat().st_size / 1_048_576
+        if verbose:
+            print(f"{input_mb:.1f} MB")
+
+        # 2 — Convert locally
+        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        pfc_mb = tmp_pfc.stat().st_size / 1_048_576
+
+        # 3 — Upload .pfc
+        if verbose:
+            print(f"     Uploading  s3://{out_bucket}/{out_key} ...", end=" ", flush=True)
+        s3.upload_file(str(tmp_pfc), out_bucket, out_key)
+        if verbose:
+            print(f"{pfc_mb:.1f} MB")
+
+        # 4 — Upload .pfc.bidx
+        bidx_local = Path(str(tmp_pfc) + ".bidx")
+        if bidx_local.exists():
+            bidx_key = out_key + ".bidx"
+            s3.upload_file(str(bidx_local), out_bucket, bidx_key)
+            if verbose:
+                print(f"     Uploading  s3://{out_bucket}/{bidx_key}  (index)")
+
+        # 5 — Optionally delete original
+        if delete_original:
+            s3.delete_object(Bucket=bucket, Key=key)
+            if verbose:
+                print(f"     Deleted    s3://{bucket}/{key}")
+
+        ratio = pfc_mb / stats["decompressed_mb"] * 100 if stats["decompressed_mb"] > 0 else 0
+        if verbose:
+            print(
+                f"     Done: original {stats['decompressed_mb']:.1f} MB  →  "
+                f"pfc {pfc_mb:.1f} MB  ({ratio:.1f}% of original)  ✓"
+            )
+
+        return {**stats, "s3_key": key, "s3_out_key": out_key}
+
+
+def cmd_s3(args, pfc_binary: str):
+    """Handle the `s3` subcommand."""
+    s3 = _s3_client(args)
+
+    out_bucket = args.out_bucket or args.bucket
+    out_prefix = args.out_prefix or args.prefix
+
+    if args.key:
+        # Single object
+        try:
+            s3_convert_file(
+                s3, args.bucket, args.key,
+                out_bucket, out_prefix,
+                pfc_binary, fmt=args.format,
+                verbose=True,
+                delete_original=args.delete,
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        # Batch: all objects under prefix
+        print(f"Listing s3://{args.bucket}/{args.prefix} ...")
+        keys = s3_list_objects(s3, args.bucket, args.prefix)
+
+        # Filter by format extension if specified
+        if args.format:
+            ext = f".jsonl.{args.format}"
+            keys = [k for k in keys if k.lower().endswith(ext) or k.lower().endswith(f".{args.format}")]
+
+        if not keys:
+            print("No matching objects found.")
+            sys.exit(0)
+
+        print(f"Found {len(keys)} object(s) to convert\n")
+        success = failed = 0
+
+        for key in keys:
+            try:
+                s3_convert_file(
+                    s3, args.bucket, key,
+                    out_bucket, out_prefix,
+                    pfc_binary, fmt=args.format,
+                    verbose=args.verbose,
+                    delete_original=args.delete,
+                )
+                success += 1
+            except Exception as exc:
+                print(f"  ERROR {key}: {exc}", file=sys.stderr)
+                failed += 1
+
+        print(f"\nDone: {success} converted, {failed} failed")
+        sys.exit(0 if failed == 0 else 1)
+
+
+def cmd_glacier(args, pfc_binary: str):
+    """
+    Handle `glacier` subcommand.
+
+    Glacier objects must be restored before download.
+    This command:
+      1. Initiates restore for all matching objects (if not already restored)
+      2. Waits (or exits with status if still restoring)
+      3. Converts all restored objects to PFC
+    """
+    s3 = _s3_client(args)
+
+    print(f"Listing s3://{args.bucket}/{args.prefix} ...")
+    keys = s3_list_objects(s3, args.bucket, args.prefix)
+    if args.format:
+        ext = f".{args.format}"
+        keys = [k for k in keys if k.lower().endswith(ext)]
+
+    if not keys:
+        print("No matching objects found.")
+        sys.exit(0)
+
+    print(f"Found {len(keys)} object(s)\n")
+
+    restoring = []
+    ready     = []
+    failed_r  = []
+
+    for key in keys:
+        try:
+            head = s3.head_object(Bucket=args.bucket, Key=key)
+            restore = head.get("Restore", "")
+            storage = head.get("StorageClass", "STANDARD")
+
+            if storage not in ("GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"):
+                # Not in Glacier — treat as normal S3
+                ready.append(key)
+                continue
+
+            if "ongoing-request=\"true\"" in restore:
+                print(f"  ⏳ RESTORING: {key}")
+                restoring.append(key)
+            elif "ongoing-request=\"false\"" in restore:
+                print(f"  ✅ READY    : {key}")
+                ready.append(key)
+            else:
+                # Not yet initiated — start restore
+                print(f"  🔄 INITIATING restore: {key}")
+                s3.restore_object(
+                    Bucket=args.bucket,
+                    Key=key,
+                    RestoreRequest={
+                        "Days": args.days,
+                        "GlacierJobParameters": {"Tier": args.tier.capitalize()},
+                    },
+                )
+                restoring.append(key)
+
+        except Exception as exc:
+            print(f"  ❌ ERROR {key}: {exc}")
+            failed_r.append(key)
+
+    print(f"\nStatus: {len(ready)} ready, {len(restoring)} restoring, {len(failed_r)} errors")
+
+    if restoring:
+        print(
+            f"\n⏳ {len(restoring)} object(s) still restoring.\n"
+            f"   Tier '{args.tier}' typically takes:\n"
+            f"     Standard  : 3–5 hours\n"
+            f"     Expedited : 1–5 minutes\n"
+            f"     Bulk      : 5–12 hours\n"
+            f"\n   Re-run this command later to convert when ready.\n"
+        )
+        if not ready:
+            sys.exit(2)  # exit 2 = still waiting (not an error)
+
+    if not ready:
+        print("No objects ready to convert.")
+        sys.exit(0)
+
+    # Convert ready objects
+    out_bucket = args.out_bucket or args.bucket
+    out_prefix = args.out_prefix or args.prefix
+    success = failed = 0
+
+    for key in ready:
+        try:
+            s3_convert_file(
+                s3, args.bucket, key,
+                out_bucket, out_prefix,
+                pfc_binary, fmt=args.format,
+                verbose=args.verbose,
+                delete_original=args.delete,
+            )
+            success += 1
+        except Exception as exc:
+            print(f"  ERROR {key}: {exc}", file=sys.stderr)
+            failed += 1
+
+    print(f"\nDone: {success} converted, {failed} failed")
+    sys.exit(0 if failed == 0 else 1)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -333,14 +599,40 @@ Install pfc_jsonl binary first:
 
     sub = parser.add_subparsers(dest="command")
 
-    # ---- convert ----
-    conv = sub.add_parser("convert", help="Convert compressed JSONL to PFC")
+    # ---- convert (Stage 1 — local) ----
+    conv = sub.add_parser("convert", help="Convert compressed JSONL to PFC (local files)")
     conv.add_argument("input",  nargs="?", help="Input file")
     conv.add_argument("output", nargs="?", help="Output .pfc file (optional, auto-generated if omitted)")
     conv.add_argument("--dir",        metavar="DIR",  help="Convert all JSONL archives in DIR")
     conv.add_argument("--output-dir", metavar="DIR",  help="Output directory (used with --dir)")
     conv.add_argument("--recursive", "-r", action="store_true", help="Recurse into subdirectories")
     _add_common(conv)
+
+    # ---- s3 (Stage 2 — Amazon S3) ----
+    def _add_s3_common(p):
+        p.add_argument("--bucket",      required=True, help="Source S3 bucket name")
+        p.add_argument("--key",         default=None,  help="Single object key (omit for batch)")
+        p.add_argument("--prefix",      default="",    help="Object prefix for batch mode")
+        p.add_argument("--out-bucket",  default=None,  help="Destination bucket (default: same as source)")
+        p.add_argument("--out-prefix",  default=None,  help="Destination prefix (default: same as source prefix)")
+        p.add_argument("--region",      default="us-east-1", help="AWS region (default: us-east-1)")
+        p.add_argument("--endpoint-url",default=None,  help="Custom S3 endpoint (e.g. MinIO: http://localhost:9000)")
+        p.add_argument("--access-key",  default=None,  help="AWS access key (default: from env/~/.aws)")
+        p.add_argument("--secret-key",  default=None,  help="AWS secret key")
+        p.add_argument("--delete",      action="store_true", help="Delete original object after conversion")
+        _add_common(p)
+
+    s3p = sub.add_parser("s3", help="Convert S3 objects (gzip/zstd/bzip2/lz4 → pfc) in-place")
+    _add_s3_common(s3p)
+
+    # ---- glacier (Stage 2 — S3 Glacier) ----
+    glp = sub.add_parser("glacier", help="Restore + convert S3 Glacier objects to PFC")
+    _add_s3_common(glp)
+    glp.add_argument("--tier",  default="standard",
+                     choices=["standard", "expedited", "bulk"],
+                     help="Glacier retrieval tier (default: standard = 3-5h)")
+    glp.add_argument("--days",  type=int, default=3,
+                     help="Days to keep restored copy available (default: 3)")
 
     return parser
 
@@ -370,6 +662,16 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # ---- s3 command ----
+    if args.command == "s3":
+        cmd_s3(args, pfc_binary)
+        return
+
+    # ---- glacier command ----
+    if args.command == "glacier":
+        cmd_glacier(args, pfc_binary)
+        return
 
     # ---- convert command ----
     if args.command == "convert":
