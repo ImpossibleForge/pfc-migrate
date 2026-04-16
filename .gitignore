@@ -8,3 +8,11 @@ build/
 *.pfc.bidx
 *.jsonl
 *.jsonl.gz
+
+# Local version backups (not for GitHub)
+*_alldb.py
+*_alldb.toml
+*_alldb.md
+*_cratedb.py
+*_cratedb.toml
+*_cratedb.md

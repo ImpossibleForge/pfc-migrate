@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfc-migrate"
-version = "0.3.2"
-description = "Convert compressed JSONL archives (gzip, zstd, bzip2, lz4) to PFC format — local, S3, Azure, GCS"
+version = "1.1.0"
+description = "Export CrateDB data to PFC cold storage — and convert JSONL archives from local disk, S3, Azure, or GCS"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
-keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier"]
+keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier", "cratedb", "cold-storage"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -22,12 +22,21 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# File format support
 zstd  = ["zstandard>=0.21"]
 lz4   = ["lz4>=4.0"]
+# Cloud storage backends
 s3    = ["boto3>=1.26"]
 azure = ["azure-storage-blob>=12.9.0"]
 gcs   = ["google-cloud-storage>=2.0"]
-all   = ["zstandard>=0.21", "lz4>=4.0", "boto3>=1.26", "azure-storage-blob>=12.9.0", "google-cloud-storage>=2.0"]
+# CrateDB direct export
+postgres = ["psycopg2-binary>=2.9"]
+# Everything
+all = [
+    "zstandard>=0.21", "lz4>=4.0",
+    "boto3>=1.26", "azure-storage-blob>=12.9.0", "google-cloud-storage>=2.0",
+    "psycopg2-binary>=2.9",
+]
 
 [project.scripts]
 pfc-migrate = "pfc_migrate:main"

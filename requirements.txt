@@ -1,8 +1,14 @@
+# pfc-migrate v1.1.0 — CrateDB edition
 # Core: no extra dependencies (gzip + bz2 are Python stdlib)
 
-# Optional — install what you need:
-# zstandard>=0.21   # for .zst files
-# lz4>=4.0          # for .lz4 files
+# CrateDB direct export:
+psycopg2-binary>=2.9          # pip install pfc-migrate[postgres]
 
-# Install all optional deps at once:
-# pip install pfc-migrate[all]
+# Cloud storage backends (optional — install what you need):
+# boto3>=1.26                  # S3 / Glacier  ->  pip install pfc-migrate[s3]
+# azure-storage-blob>=12.9.0  # Azure Blob     ->  pip install pfc-migrate[azure]
+# google-cloud-storage>=2.0   # GCS            ->  pip install pfc-migrate[gcs]
+
+# File format support (optional):
+# zstandard>=0.21              # .zst files    ->  pip install pfc-migrate[zstd]
+# lz4>=4.0                     # .lz4 files    ->  pip install pfc-migrate[lz4]

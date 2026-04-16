@@ -7,21 +7,29 @@ Supports:
   Storage       : Local filesystem  (Stage 1) ✅
                   S3 / S3 Glacier   (Stage 2) ✅
                   Azure Blob / GCS  (Stage 3) ✅
+  Live DB export: CrateDB           (Stage 4) ✅  [psycopg2 required]
 
 Usage:
   pfc-migrate convert logs.jsonl.gz  logs.pfc
   pfc-migrate convert --dir /var/log/archive/ --output-dir /var/log/pfc/
   pfc-migrate convert --dir /var/log/ --format gz --recursive --verbose
+  pfc-migrate cratedb     --host crate.example.com  --table logs --output logs.pfc
+  pfc-migrate timescaledb --host tsdb.example.com   --table metrics --output metrics.pfc
+  pfc-migrate questdb     --host quest.example.com  --table trades --output trades.pfc
 """
+
+__version__ = "1.1.0"
 
 import argparse
 import bz2
 import gzip
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -823,8 +831,245 @@ def cmd_glacier(args, pfc_binary: str):
 
 
 # ---------------------------------------------------------------------------
+# Stage 4 — PostgreSQL wire protocol export
+# Supports: CrateDB
+# ---------------------------------------------------------------------------
+
+def _pg_wire_export_to_pfc(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    dbname: str,
+    table: str,
+    output_path: Path,
+    pfc_binary: str,
+    schema: str = None,
+    ts_column: str = None,
+    from_ts: str = None,
+    to_ts: str = None,
+    batch_size: int = 10_000,
+    db_label: str = "DB",
+    verbose: bool = False,
+) -> dict:
+    """
+    Stream rows from any PostgreSQL-wire-protocol database into a PFC archive.
+
+    Supports CrateDB, TimescaleDB, QuestDB — all via psycopg2.
+    Uses fetchmany() batching (memory-safe). Named server-side cursors are NOT
+    used: CrateDB and QuestDB don't support them outside of transactions.
+
+    Flow:
+      DB  →  fetchmany(batch_size) loop  →  JSONL temp file
+          →  pfc_jsonl compress  →  output.pfc + output.pfc.bidx
+
+    Returns a dict with: rows, jsonl_mb, output_mb, ratio_pct, output
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        raise ImportError(
+            "psycopg2 is required for database export.\n"
+            "Install it: pip install psycopg2-binary"
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build table reference — schema is optional (QuestDB has none)
+    full_table = f'"{schema}"."{table}"' if schema else f'"{table}"'
+
+    # Optional time-range filter
+    conditions, params = [], []
+    if ts_column and from_ts:
+        conditions.append(f'"{ts_column}" >= %s')
+        params.append(from_ts)
+    if ts_column and to_ts:
+        conditions.append(f'"{ts_column}" < %s')
+        params.append(to_ts)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    order_clause = (f'ORDER BY "{ts_column}"') if ts_column else ""
+    query        = f"SELECT * FROM {full_table} {where_clause} {order_clause}".strip()
+
+    if verbose:
+        print(f"  → Connecting to {db_label} at {host}:{port} (db: {dbname}) ...")
+        print(f"  → Query: {query[:120]}{'...' if len(query) > 120 else ''}")
+
+    conn = psycopg2.connect(
+        host=host, port=port, user=user, password=password,
+        dbname=dbname, connect_timeout=30,
+    )
+    conn.autocommit = True
+
+    tmp_fd, tmp_jsonl = tempfile.mkstemp(
+        suffix=".jsonl",
+        prefix=f"pfc_{db_label.lower().replace(' ', '_')}_",
+    )
+    os.close(tmp_fd)
+
+    row_count   = 0
+    jsonl_bytes = 0
+
+    try:
+        cur = conn.cursor()
+        cur.execute(query, params or None)
+
+        col_names = [desc[0] for desc in cur.description]
+
+        if verbose:
+            print(f"  → Columns ({len(col_names)}): {', '.join(col_names[:8])}"
+                  f"{'...' if len(col_names) > 8 else ''}")
+            print(f"  → Streaming rows (batch size: {batch_size:,}) ...")
+
+        with open(tmp_jsonl, "w", encoding="utf-8") as fout:
+            while True:
+                batch = cur.fetchmany(batch_size)
+                if not batch:
+                    break
+
+                for raw_row in batch:
+                    row_dict = {}
+                    for col, val in zip(col_names, raw_row):
+                        if isinstance(val, datetime):
+                            val = val.isoformat()
+                        elif isinstance(val, bytes):
+                            val = val.hex()
+                        row_dict[col] = val
+
+                    line = json.dumps(row_dict, ensure_ascii=False) + "\n"
+                    fout.write(line)
+                    jsonl_bytes += len(line.encode("utf-8"))
+                    row_count   += 1
+
+                if verbose and row_count % 100_000 == 0:
+                    print(f"     {row_count:,} rows  ({jsonl_bytes / 1_048_576:.1f} MiB) ...")
+
+        cur.close()
+
+        if verbose:
+            print(f"  → Exported {row_count:,} rows  ({jsonl_bytes / 1_048_576:.1f} MiB JSONL)")
+            print(f"  → Compressing with pfc_jsonl ...")
+
+        proc = subprocess.run(
+            [pfc_binary, "compress", tmp_jsonl, str(output_path)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"pfc_jsonl compress failed (exit {proc.returncode}):\n"
+                f"{proc.stderr.strip()}"
+            )
+
+        jsonl_mb  = jsonl_bytes / 1_048_576
+        output_mb = output_path.stat().st_size / 1_048_576
+        ratio_pct = (output_mb / jsonl_mb * 100) if jsonl_mb > 0 else 0.0
+
+        if verbose:
+            print(
+                f"  ✓ {row_count:,} rows  |  "
+                f"JSONL {jsonl_mb:.1f} MiB  →  PFC {output_mb:.1f} MiB  "
+                f"({ratio_pct:.1f}%)  →  {output_path.name}"
+            )
+
+        return {
+            "rows":      row_count,
+            "jsonl_mb":  jsonl_mb,
+            "output_mb": output_mb,
+            "ratio_pct": ratio_pct,
+            "output":    str(output_path),
+        }
+
+    except Exception:
+        conn.close()
+        raise
+    finally:
+        if os.path.exists(tmp_jsonl):
+            os.unlink(tmp_jsonl)
+
+
+def _cmd_pg_wire(args, pfc_binary: str, db_label: str):
+    """Generic handler for all PostgreSQL wire protocol DB export subcommands."""
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        parts = [args.table]
+        if args.from_ts:
+            parts.append(args.from_ts.replace(":", "").replace("-", "").replace(" ", "T")[:15])
+        if args.to_ts:
+            parts.append(args.to_ts.replace(":", "").replace("-", "").replace(" ", "T")[:15])
+        output_path = Path("_".join(parts) + ".pfc")
+
+    try:
+        stats = _pg_wire_export_to_pfc(
+            host=args.host,
+            port=args.port,
+            user=args.user,
+            password=args.password,
+            dbname=args.dbname,
+            table=args.table,
+            output_path=output_path,
+            pfc_binary=pfc_binary,
+            schema=getattr(args, "schema", None) or None,
+            ts_column=args.ts_column,
+            from_ts=args.from_ts,
+            to_ts=args.to_ts,
+            batch_size=args.batch_size,
+            db_label=db_label,
+            verbose=args.verbose,
+        )
+        if not args.verbose:
+            print(
+                f"Done: {stats['rows']:,} rows  →  {stats['output']}  "
+                f"({stats['ratio_pct']:.1f}% of JSONL)"
+            )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_cratedb(args, pfc_binary: str):
+    """Handle the `cratedb` subcommand."""
+    _cmd_pg_wire(args, pfc_binary, db_label="CrateDB")
+
+
+
 # CLI
 # ---------------------------------------------------------------------------
+
+def _add_pg_wire_args(p, name, default_port, default_user, default_password,
+                      default_dbname, default_schema, example_host):
+    """Add shared CLI arguments for all PostgreSQL wire protocol subcommands."""
+    p.add_argument("--host",       required=True,
+                   help=f"{name} hostname or IP")
+    p.add_argument("--port",       type=int, default=default_port,
+                   help=f"PostgreSQL port (default: {default_port})")
+    p.add_argument("--user",       default=default_user,
+                   help=f"Username (default: {default_user})")
+    p.add_argument("--password",   default=default_password,
+                   help=f"Password (default: {repr(default_password) if default_password else 'empty'})")
+    p.add_argument("--dbname",     default=default_dbname,
+                   help=f"Database name (default: {default_dbname})")
+    if default_schema is not None:            # QuestDB has no schema concept
+        p.add_argument("--schema", default=default_schema,
+                       help=f"Schema (default: {default_schema})")
+    p.add_argument("--table",      required=True,
+                   help="Table name to export")
+    p.add_argument("--ts-column",  default=None, metavar="COL",
+                   help="Timestamp column for time-range filtering and ORDER BY")
+    p.add_argument("--from-ts",    default=None, metavar="ISO_DATETIME",
+                   help="Start of time range (ISO 8601, inclusive). Requires --ts-column.")
+    p.add_argument("--to-ts",      default=None, metavar="ISO_DATETIME",
+                   help="End of time range (ISO 8601, exclusive). Requires --ts-column.")
+    p.add_argument("--output",     default=None, metavar="FILE",
+                   help="Output .pfc file (default: {table}.pfc or {table}_{from}_{to}.pfc)")
+    p.add_argument("--batch-size", type=int, default=10_000, metavar="N",
+                   help="Rows per fetch batch (default: 10,000)")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Show row progress and size stats")
+    p.add_argument("--pfc-binary", default=None, metavar="PATH",
+                   help="Path to pfc_jsonl binary (default: auto-detect)")
+
 
 def _add_common(parser):
     parser.add_argument(
@@ -871,6 +1116,10 @@ Install pfc_jsonl binary first:
         """,
     )
 
+    parser.add_argument(
+        "--version", action="version", version=f"pfc-migrate {__version__}"
+    )
+
     sub = parser.add_subparsers(dest="command")
 
     # ---- convert (Stage 1 — local) ----
@@ -894,7 +1143,7 @@ Install pfc_jsonl binary first:
         p.add_argument("--delete",            action="store_true", help="Delete original blob after conversion")
         _add_common(p)
 
-    azp = sub.add_parser("azure", help="Convert Azure Blob Storage objects (gzip/zstd/bzip2/lz4 → pfc)")
+    azp = sub.add_parser("azure", help="Convert Azure Blob Storage objects (gzip/zstd/bzip2/lz4 -> pfc)")
     _add_azure_common(azp)
 
     # ---- gcs (Stage 3 — Google Cloud Storage) ----
@@ -908,7 +1157,7 @@ Install pfc_jsonl binary first:
         p.add_argument("--delete",       action="store_true", help="Delete original object after conversion")
         _add_common(p)
 
-    gcsp = sub.add_parser("gcs", help="Convert Google Cloud Storage objects (gzip/zstd/bzip2/lz4 → pfc)")
+    gcsp = sub.add_parser("gcs", help="Convert Google Cloud Storage objects (gzip/zstd/bzip2/lz4 -> pfc)")
     _add_gcs_common(gcsp)
 
     # ---- s3 (Stage 2 — Amazon S3) ----
@@ -925,7 +1174,7 @@ Install pfc_jsonl binary first:
         p.add_argument("--delete",      action="store_true", help="Delete original object after conversion")
         _add_common(p)
 
-    s3p = sub.add_parser("s3", help="Convert S3 objects (gzip/zstd/bzip2/lz4 → pfc) in-place")
+    s3p = sub.add_parser("s3", help="Convert S3 objects (gzip/zstd/bzip2/lz4 -> pfc) in-place")
     _add_s3_common(s3p)
 
     # ---- glacier (Stage 2 — S3 Glacier) ----
@@ -936,6 +1185,28 @@ Install pfc_jsonl binary first:
                      help="Glacier retrieval tier (default: standard = 3-5h)")
     glp.add_argument("--days",  type=int, default=3,
                      help="Days to keep restored copy available (default: 3)")
+
+    # ---- cratedb (Stage 4a) ----
+    crdb = sub.add_parser(
+        "cratedb",
+        help="Export CrateDB table -> PFC archive (PostgreSQL wire protocol, port 5432)",
+        description=(
+            "Stream rows from a CrateDB table into a PFC cold-storage archive.\n"
+            "CrateDB default port: 5432  |  Requires: pip install psycopg2-binary"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  pfc-migrate cratedb --host crate.example.com --table logs --output logs.pfc
+  pfc-migrate cratedb --host crate.example.com --table events \\
+    --ts-column timestamp --from-ts "2024-01-01T00:00:00" --to-ts "2024-02-01T00:00:00" \\
+    --output events_jan2024.pfc --verbose
+        """,
+    )
+    _add_pg_wire_args(crdb, "CrateDB",
+                      default_port=5432, default_user="crate",
+                      default_password="",   default_dbname="doc",
+                      default_schema="doc",  example_host="crate.example.com")
 
     return parser
 
@@ -986,7 +1257,10 @@ def main():
         cmd_gcs(args, pfc_binary)
         return
 
-    # ---- convert command ----
+    # ---- Stage 4: PostgreSQL wire protocol ----
+    if args.command == "cratedb":
+        cmd_cratedb(args, pfc_binary)
+        return
     if args.command == "convert":
 
         if args.dir:
