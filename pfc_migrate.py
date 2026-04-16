@@ -937,6 +937,14 @@ def _pg_wire_export_to_pfc(
                             val = val.hex()
                         row_dict[col] = val
 
+                    # Ensure pfc_jsonl can build its timestamp index.
+                    # pfc_jsonl recognises "timestamp" and "@timestamp" — not
+                    # arbitrary column names.  We add "timestamp" as an alias
+                    # so time-range queries (pfc_jsonl query / s3-fetch --from
+                    # --to) work regardless of what the CrateDB column is called.
+                    if ts_column and ts_column in row_dict and "timestamp" not in row_dict:
+                        row_dict["timestamp"] = row_dict[ts_column]
+
                     line = json.dumps(row_dict, ensure_ascii=False) + "\n"
                     fout.write(line)
                     jsonl_bytes += len(line.encode("utf-8"))
