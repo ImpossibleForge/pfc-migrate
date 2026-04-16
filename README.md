@@ -174,8 +174,6 @@ pfc-migrate convert --dir /var/log/archive/ --output-dir /var/log/pfc/
 # Recursive + verbose
 pfc-migrate convert --dir /mnt/logs/ -r -v
 
-# Delete originals after successful conversion
-pfc-migrate convert --dir /var/log/archive/ --output-dir /var/log/pfc/ --delete
 ```
 
 ---
@@ -273,7 +271,7 @@ See [examples/cratedb_archive_explorer.py](examples/cratedb_archive_explorer.py)
 
 ## Lossless guarantee
 
-Every conversion is verified by full decompression and MD5 check before output is written. If anything doesn't match, the output file is deleted and the error is reported — the original is never modified unless `--delete` is explicitly passed.
+Every conversion is verified by full decompression and MD5 check before output is written. If anything doesn't match, the output file is deleted and the error is reported — the original is never modified. For S3, GCS, and Azure subcommands, `--delete` removes the original cloud object only after successful verification.
 
 ---
 
