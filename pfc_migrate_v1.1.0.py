@@ -18,7 +18,7 @@ Usage:
   pfc-migrate questdb     --host quest.example.com  --table trades --output trades.pfc
 """
 
-__version__ = "1.2.0"
+__version__ = "1.1.0"
 
 import argparse
 import bz2
@@ -832,7 +832,7 @@ def cmd_glacier(args, pfc_binary: str):
 
 # ---------------------------------------------------------------------------
 # Stage 4 — PostgreSQL wire protocol export
-# Supports: CrateDB (port 5432), QuestDB (port 8812)
+# Supports: CrateDB
 # ---------------------------------------------------------------------------
 
 def _pg_wire_export_to_pfc(
@@ -1041,10 +1041,6 @@ def cmd_cratedb(args, pfc_binary: str):
     _cmd_pg_wire(args, pfc_binary, db_label="CrateDB")
 
 
-def cmd_questdb(args, pfc_binary: str):
-    """Handle the `questdb` subcommand."""
-    _cmd_pg_wire(args, pfc_binary, db_label="QuestDB")
-
 
 # CLI
 # ---------------------------------------------------------------------------
@@ -1220,29 +1216,6 @@ examples:
                       default_password="",   default_dbname="doc",
                       default_schema="doc",  example_host="crate.example.com")
 
-    # ---- questdb (Stage 4b) ----
-    qdp = sub.add_parser(
-        "questdb",
-        help="Export QuestDB table -> PFC archive (PostgreSQL wire protocol, port 8812)",
-        description=(
-            "Stream rows from a QuestDB table into a PFC cold-storage archive.\n"
-            "QuestDB default port: 8812  |  Requires: pip install psycopg2-binary\n"
-            "Note: QuestDB has no schema concept — tables are referenced by name only."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  pfc-migrate questdb --host quest.example.com --table trades --output trades.pfc
-  pfc-migrate questdb --host quest.example.com --table sensor_data \\
-    --ts-column timestamp --from-ts "2024-01-01T00:00:00" --to-ts "2024-02-01T00:00:00" \\
-    --output sensor_jan2024.pfc --verbose
-        """,
-    )
-    _add_pg_wire_args(qdp, "QuestDB",
-                      default_port=8812, default_user="admin",
-                      default_password="quest", default_dbname="qdb",
-                      default_schema=None,       example_host="quest.example.com")
-
     return parser
 
 
@@ -1295,9 +1268,6 @@ def main():
     # ---- Stage 4: PostgreSQL wire protocol ----
     if args.command == "cratedb":
         cmd_cratedb(args, pfc_binary)
-        return
-    if args.command == "questdb":
-        cmd_questdb(args, pfc_binary)
         return
     if args.command == "convert":
 

@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![PFC-JSONL](https://img.shields.io/badge/PFC--JSONL-v3.4-green.svg)](https://github.com/ImpossibleForge/pfc-jsonl)
-[![Version](https://img.shields.io/badge/pfc--migrate-v1.1.0-brightgreen.svg)](https://github.com/ImpossibleForge/pfc-migrate/releases)
+[![Version](https://img.shields.io/badge/pfc--migrate-v1.2.0-brightgreen.svg)](https://github.com/ImpossibleForge/pfc-migrate/releases)
 
 Export any JSONL data directly to PFC cold storage — or convert existing compressed JSONL archives from local disk, S3, Azure, or GCS. No intermediate files, no schema changes, no pipelines.
 
@@ -15,6 +15,7 @@ Export any JSONL data directly to PFC cold storage — or convert existing compr
 | Command | What it does |
 |---------|-------------|
 | `pfc-migrate cratedb` | Stream a CrateDB table directly to a `.pfc` archive |
+| `pfc-migrate questdb` | Stream a QuestDB table directly to a `.pfc` archive |
 | `pfc-migrate convert` | Convert gzip/zstd/bzip2/lz4/JSONL files to PFC |
 | `pfc-migrate s3` | Convert JSONL archives in S3 in-place |
 | `pfc-migrate glacier` | Restore + convert S3 Glacier archives to PFC |
@@ -107,6 +108,9 @@ pip install pfc-migrate[gcs]
 
 # For CrateDB direct export
 pip install pfc-migrate[postgres]
+
+# For QuestDB direct export
+pip install pfc-migrate[questdb]
 ```
 
 ---
@@ -162,6 +166,57 @@ pfc-migrate cratedb --host localhost --table logs \
 | `--batch-size` | 10000 | Rows per fetch (memory-safe batching) |
 | `--output` | _(auto)_ | Output `.pfc` file |
 | `--verbose` | false | Show row progress and size stats |
+
+---
+
+## Usage — QuestDB direct export
+
+Stream rows directly from a QuestDB table into a `.pfc` archive. No intermediate files.
+
+```bash
+pip install pfc-migrate[questdb]
+
+# Export one week of trades
+pfc-migrate questdb \
+  --host quest.example.com \
+  --table trades \
+  --ts-column timestamp \
+  --from-ts "2026-03-01" --to-ts "2026-03-08" \
+  --output trades_2026-03-01.pfc \
+  --verbose
+
+# Auto-named output: trades_20260301_20260308.pfc
+pfc-migrate questdb --host localhost --table trades \
+  --from-ts "2026-03-01" --to-ts "2026-03-08" --verbose
+```
+
+**Verbose output:**
+```
+  -> Connecting to QuestDB at localhost:8812 (db: qdb) ...
+  -> Columns (5): timestamp, symbol, price, volume, side
+  -> Streaming rows (batch size: 10,000) ...
+     100,000 rows  (18.1 MiB) ...
+  -> Exported 120,000 rows  (21.7 MiB JSONL)
+  -> Compressing with pfc_jsonl ...
+  ✓ 120,000 rows  |  JSONL 21.7 MiB  ->  PFC 1.3 MiB  (6.0%)  ->  trades_20260301_20260308.pfc
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--host` | localhost | QuestDB host |
+| `--port` | 8812 | PostgreSQL wire port |
+| `--user` | admin | Username |
+| `--password` | quest | Password |
+| `--dbname` | qdb | Database name |
+| `--table` | **required** | Table to export (no schema prefix) |
+| `--ts-column` | None | Timestamp column for WHERE filter and ORDER BY |
+| `--from-ts` | None | Start of range (inclusive, ISO 8601) |
+| `--to-ts` | None | End of range (exclusive, ISO 8601) |
+| `--batch-size` | 10000 | Rows per fetch (memory-safe batching) |
+| `--output` | _(auto)_ | Output `.pfc` file |
+| `--verbose` | false | Show row progress and size stats |
+
+> **Note:** QuestDB has no schema concept — tables are referenced by name only. There is no `--schema` option.
 
 ---
 
@@ -275,6 +330,39 @@ See [examples/cratedb_archive_explorer.py](examples/cratedb_archive_explorer.py)
 
 ---
 
+## Hybrid queries: QuestDB live + PFC cold storage
+
+Query QuestDB live data and cold PFC archives in a single DuckDB SQL statement:
+
+```python
+import duckdb, psycopg2
+
+con = duckdb.connect()
+con.execute("INSTALL pfc FROM community; LOAD pfc; LOAD json;")
+
+# Register QuestDB live data as a view
+questdb_conn = psycopg2.connect(host="localhost", port=8812,
+                                user="admin", password="quest", dbname="qdb")
+live_data = questdb_conn.cursor()
+live_data.execute("SELECT * FROM trades WHERE timestamp >= '2026-04-01'")
+con.register("live_trades", live_data.fetchall())
+
+# Query cold PFC archives + hot live data in one SQL
+result = con.execute("""
+    SELECT timestamp, symbol, price, volume
+    FROM pfc_scan([
+        '/archives/trades_2026-01.pfc',
+        '/archives/trades_2026-02.pfc',
+        '/archives/trades_2026-03.pfc'
+    ])
+    UNION ALL
+    SELECT timestamp, symbol, price, volume FROM live_trades
+    ORDER BY timestamp
+""").fetchall()
+```
+
+---
+
 ## Lossless guarantee
 
 Every conversion is verified by full decompression and MD5 check before output is written. If anything doesn't match, the output file is deleted and the error is reported — the original is never modified. For S3, GCS, and Azure subcommands, `--delete` removes the original cloud object only after successful verification.
@@ -289,6 +377,7 @@ Every conversion is verified by full decompression and MD5 check before output i
 | [pfc-duckdb](https://github.com/ImpossibleForge/pfc-duckdb) | DuckDB Community Extension (`INSTALL pfc FROM community`) |
 | [pfc-fluentbit](https://github.com/ImpossibleForge/pfc-fluentbit) | Fluent Bit -> PFC forwarder for live pipelines |
 | [pfc-archiver-cratedb](https://github.com/ImpossibleForge/pfc-archiver-cratedb) | Autonomous daemon: archive old CrateDB partitions automatically |
+| [pfc-archiver-questdb](https://github.com/ImpossibleForge/pfc-archiver-questdb) | Autonomous daemon: archive old QuestDB partitions automatically |
 
 ---
 

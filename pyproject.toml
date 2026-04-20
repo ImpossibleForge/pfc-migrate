@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfc-migrate"
-version = "1.1.0"
-description = "Export CrateDB data to PFC cold storage — and convert JSONL archives from local disk, S3, Azure, or GCS"
+version = "1.2.0"
+description = "Export database data to PFC cold storage — and convert JSONL archives from local disk, S3, Azure, or GCS"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
-keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier", "cratedb", "cold-storage"]
+keywords = ["pfc", "jsonl", "compression", "logs", "duckdb", "migration", "s3", "azure", "gcs", "glacier", "cratedb", "questdb", "cold-storage"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -29,8 +29,9 @@ lz4   = ["lz4>=4.0"]
 s3    = ["boto3>=1.26"]
 azure = ["azure-storage-blob>=12.9.0"]
 gcs   = ["google-cloud-storage>=2.0"]
-# CrateDB direct export
+# Database direct export (CrateDB, QuestDB, and any PostgreSQL wire protocol DB)
 postgres = ["psycopg2-binary>=2.9"]
+questdb  = ["psycopg2-binary>=2.9"]
 # Everything
 all = [
     "zstandard>=0.21", "lz4>=4.0",
