@@ -288,7 +288,7 @@ Every conversion is verified by full decompression and MD5 check before output i
 | [pfc-jsonl](https://github.com/ImpossibleForge/pfc-jsonl) | Core binary — compress, decompress, query |
 | [pfc-duckdb](https://github.com/ImpossibleForge/pfc-duckdb) | DuckDB Community Extension (`INSTALL pfc FROM community`) |
 | [pfc-fluentbit](https://github.com/ImpossibleForge/pfc-fluentbit) | Fluent Bit -> PFC forwarder for live pipelines |
-| [pfc-archiver](https://github.com/ImpossibleForge/pfc-archiver) | Autonomous daemon: archive old CrateDB partitions automatically |
+| [pfc-archiver-cratedb](https://github.com/ImpossibleForge/pfc-archiver-cratedb) | Autonomous daemon: archive old CrateDB partitions automatically |
 
 ---
 
