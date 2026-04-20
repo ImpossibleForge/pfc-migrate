@@ -1,4 +1,4 @@
-# pfc-migrate — Move CrateDB log data to PFC cold storage
+# pfc-migrate — Move any JSONL log or event data to PFC cold storage
 
 [![PyPI](https://img.shields.io/badge/PyPI-pfc--migrate-blue.svg)](https://pypi.org/project/pfc-migrate/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -6,7 +6,7 @@
 [![PFC-JSONL](https://img.shields.io/badge/PFC--JSONL-v3.4-green.svg)](https://github.com/ImpossibleForge/pfc-jsonl)
 [![Version](https://img.shields.io/badge/pfc--migrate-v1.1.0-brightgreen.svg)](https://github.com/ImpossibleForge/pfc-migrate/releases)
 
-Export CrateDB table data directly to PFC cold storage — or convert existing compressed JSONL archives from local disk, S3, Azure, or GCS. No intermediate files, no schema changes, no pipelines.
+Export any JSONL data directly to PFC cold storage — or convert existing compressed JSONL archives from local disk, S3, Azure, or GCS. No intermediate files, no schema changes, no pipelines.
 
 ---
 
