@@ -74,11 +74,17 @@ Cloud conversions run **in-region**: download → convert → upload, without ev
 **The `pfc_jsonl` binary must be installed on the machine running the export:**
 
 ```bash
+# Linux x64:
 curl -L https://github.com/ImpossibleForge/pfc-jsonl/releases/latest/download/pfc_jsonl-linux-x64 \
+     -o /usr/local/bin/pfc_jsonl && chmod +x /usr/local/bin/pfc_jsonl
+
+# macOS (Apple Silicon M1–M4):
+curl -L https://github.com/ImpossibleForge/pfc-jsonl/releases/latest/download/pfc_jsonl-macos-arm64 \
      -o /usr/local/bin/pfc_jsonl && chmod +x /usr/local/bin/pfc_jsonl
 ```
 
-> **Platform:** Linux x86_64. macOS binary coming soon.
+> **macOS Intel (x64):** Binary coming soon.
+> **Windows:** No native binary. Use WSL2 or a Linux machine.
 
 ---
 
