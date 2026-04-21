@@ -16,3 +16,6 @@ build/
 *_cratedb.py
 *_cratedb.toml
 *_cratedb.md
+.env
+.pfc_buffer.jsonl
+.pfc_buffer.compressing
