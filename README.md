@@ -381,6 +381,7 @@ Every conversion is verified by full decompression and MD5 check before output i
 | [pfc-archiver-cratedb](https://github.com/ImpossibleForge/pfc-archiver-cratedb) | Autonomous daemon: archive old CrateDB partitions automatically |
 | [pfc-archiver-questdb](https://github.com/ImpossibleForge/pfc-archiver-questdb) | Autonomous daemon: archive old QuestDB partitions automatically |
 | [pfc-vector](https://github.com/ImpossibleForge/pfc-vector) | High-performance Rust ingest daemon for Vector.dev and Telegraf |
+| [pfc-otel-collector](https://github.com/ImpossibleForge/pfc-otel-collector) | OpenTelemetry OTLP/HTTP log exporter |
 
 ---
 
