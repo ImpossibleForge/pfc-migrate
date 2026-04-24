@@ -388,6 +388,6 @@ Every conversion is verified by full decompression and MD5 check before output i
 
 ## License
 
-MIT — see [LICENSE](https://github.com/ImpossibleForge/pfc-migrate/blob/main/LICENSE).
+pfc-migrate (this repository) is released under the MIT License — see [LICENSE](LICENSE).
 
-*Built by [ImpossibleForge](https://github.com/ImpossibleForge)*
+The PFC-JSONL binary (`pfc_jsonl`) is proprietary software — free for personal and open-source use. Commercial use requires a license: [info@impossibleforge.com](mailto:info@impossibleforge.com)
