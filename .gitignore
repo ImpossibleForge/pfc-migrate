@@ -10,6 +10,7 @@ build/
 *.jsonl.gz
 
 # Local version backups (not for GitHub)
+*_backup.py
 *_alldb.py
 *_alldb.toml
 *_alldb.md

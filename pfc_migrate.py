@@ -4,32 +4,35 @@ pfc-migrate — Convert compressed JSONL archives to PFC format.
 
 Supports:
   Input formats : gzip (.gz), zstd (.zst), bzip2 (.bz2), lz4 (.lz4), plain JSONL
-  Storage       : Local filesystem  (Stage 1) ✅
-                  S3 / S3 Glacier   (Stage 2) ✅
-                  Azure Blob / GCS  (Stage 3) ✅
-  Live DB export: CrateDB           (Stage 4) ✅  [psycopg2 required]
+  Storage       : Local filesystem
+                  S3 / S3 Glacier
+                  Azure Blob Storage
+                  Google Cloud Storage
 
 Usage:
   pfc-migrate convert logs.jsonl.gz  logs.pfc
   pfc-migrate convert --dir /var/log/archive/ --output-dir /var/log/pfc/
   pfc-migrate convert --dir /var/log/ --format gz --recursive --verbose
-  pfc-migrate cratedb     --host crate.example.com  --table logs --output logs.pfc
-  pfc-migrate timescaledb --host tsdb.example.com   --table metrics --output metrics.pfc
-  pfc-migrate questdb     --host quest.example.com  --table trades --output trades.pfc
+  pfc-migrate s3      --bucket my-bucket --prefix logs/2025/
+  pfc-migrate azure   --container my-container --blob logs.jsonl.gz
+  pfc-migrate gcs     --bucket my-bucket --blob logs/app.jsonl.zst
+  pfc-migrate glacier --bucket my-bucket --prefix archive/
+
+Note: Database export (CrateDB, QuestDB, etc.) has moved to dedicated tools:
+  pfc-export-cratedb  https://github.com/ImpossibleForge/pfc-export-cratedb
+  pfc-export-questdb  https://github.com/ImpossibleForge/pfc-export-questdb
 """
 
-__version__ = "1.2.0"
+__version__ = "2.1.0"
 
 import argparse
 import bz2
 import gzip
-import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -84,13 +87,11 @@ def output_path_for(input_path: Path, output_dir=None) -> Path:
     """Derive the .pfc output path from an input path."""
     name = input_path.name
 
-    # Strip compression extension if present
     for ext in FORMAT_EXTENSIONS:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
 
-    # Replace .jsonl / .json / .ndjson → .pfc, or append .pfc
     for base_ext in (".jsonl", ".json", ".ndjson"):
         if name.lower().endswith(base_ext):
             name = name[: -len(base_ext)] + ".pfc"
@@ -176,10 +177,8 @@ def convert_file(
     os.close(tmp_fd)
 
     try:
-        # Step 1: decompress
         _decompress_to_tmp(input_path, fmt, tmp_path, verbose)
 
-        # Step 2: pfc_jsonl compress
         result = subprocess.run(
             [pfc_binary, "compress", tmp_path, str(output_path)],
             capture_output=True,
@@ -190,9 +189,8 @@ def convert_file(
                 f"pfc_jsonl compress failed (exit {result.returncode}):\n{result.stderr.strip()}"
             )
 
-        # Stats — compare PFC to the decompressed (original) size for honest ratio
         compressed_mb   = input_path.stat().st_size      / 1_048_576
-        decompressed_mb = Path(tmp_path).stat().st_size  / 1_048_576  # size before PFC
+        decompressed_mb = Path(tmp_path).stat().st_size  / 1_048_576
         output_mb       = output_path.stat().st_size     / 1_048_576
         ratio_pct       = (output_mb / decompressed_mb * 100) if decompressed_mb > 0 else 0.0
 
@@ -275,7 +273,6 @@ def convert_dir(
             print(f"  ERROR {f.name}: {exc}", file=sys.stderr)
             failed += 1
 
-    # Summary
     if success:
         overall_ratio = (total_out_mb / total_decompressed_mb * 100) if total_decompressed_mb > 0 else 0
         saved_mb = total_decompressed_mb - total_out_mb
@@ -292,11 +289,10 @@ def convert_dir(
 
 
 # ---------------------------------------------------------------------------
-# S3 / Glacier support (Stage 2)
+# S3 / Glacier support
 # ---------------------------------------------------------------------------
 
 def _s3_client(args):
-    """Create a boto3 S3 client from CLI args."""
     try:
         import boto3
     except ImportError:
@@ -314,7 +310,6 @@ def _s3_client(args):
 
 
 def s3_list_objects(s3, bucket: str, prefix: str) -> list:
-    """List all objects under bucket/prefix. Returns list of keys."""
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -324,37 +319,24 @@ def s3_list_objects(s3, bucket: str, prefix: str) -> list:
 
 
 def s3_convert_file(
-    s3,
-    bucket: str,
-    key: str,
-    out_bucket: str,
-    out_prefix: str,
-    pfc_binary: str,
-    fmt: str = None,
-    verbose: bool = False,
-    delete_original: bool = False,
+    s3, bucket, key, out_bucket, out_prefix, pfc_binary,
+    fmt=None, verbose=False, delete_original=False,
 ) -> dict:
-    """
-    Download one S3 object, convert to PFC, upload back.
-    Returns stats dict or raises on error.
-    """
     src_path = Path(key)
     fmt = fmt or detect_format(src_path)
     if not fmt:
         raise ValueError(f"Cannot detect format for '{key}'. Use --format.")
 
-    # Derive output key
-    out_name = output_path_for(src_path).name          # e.g. logs.pfc
+    out_name = output_path_for(src_path).name
     out_key  = (out_prefix.rstrip("/") + "/" + out_name) if out_prefix else out_name
 
     if verbose:
         print(f"  → s3://{bucket}/{key}  [{fmt}]")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_input  = Path(tmpdir) / src_path.name
-        tmp_pfc    = Path(tmpdir) / out_name
+        tmp_input = Path(tmpdir) / src_path.name
+        tmp_pfc   = Path(tmpdir) / out_name
 
-        # 1 — Download
         if verbose:
             print(f"     Downloading ...", end=" ", flush=True)
         s3.download_file(bucket, key, str(tmp_input))
@@ -362,18 +344,15 @@ def s3_convert_file(
         if verbose:
             print(f"{input_mb:.1f} MB")
 
-        # 2 — Convert locally
-        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        stats  = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
         pfc_mb = tmp_pfc.stat().st_size / 1_048_576
 
-        # 3 — Upload .pfc
         if verbose:
             print(f"     Uploading  s3://{out_bucket}/{out_key} ...", end=" ", flush=True)
         s3.upload_file(str(tmp_pfc), out_bucket, out_key)
         if verbose:
             print(f"{pfc_mb:.1f} MB")
 
-        # 4 — Upload .pfc.bidx
         bidx_local = Path(str(tmp_pfc) + ".bidx")
         if bidx_local.exists():
             bidx_key = out_key + ".bidx"
@@ -381,7 +360,6 @@ def s3_convert_file(
             if verbose:
                 print(f"     Uploading  s3://{out_bucket}/{bidx_key}  (index)")
 
-        # 5 — Optionally delete original
         if delete_original:
             s3.delete_object(Bucket=bucket, Key=key)
             if verbose:
@@ -389,20 +367,16 @@ def s3_convert_file(
 
         ratio = pfc_mb / stats["decompressed_mb"] * 100 if stats["decompressed_mb"] > 0 else 0
         if verbose:
-            print(
-                f"     Done: original {stats['decompressed_mb']:.1f} MB  →  "
-                f"pfc {pfc_mb:.1f} MB  ({ratio:.1f}% of original)  ✓"
-            )
+            print(f"     Done: {stats['decompressed_mb']:.1f} MB → pfc {pfc_mb:.1f} MB ({ratio:.1f}%)  ✓")
 
         return {**stats, "s3_key": key, "s3_out_key": out_key}
 
 
 # ---------------------------------------------------------------------------
-# Azure Blob Storage support (Stage 3)
+# Azure Blob Storage support
 # ---------------------------------------------------------------------------
 
 def _azure_client(args):
-    """Create Azure BlobServiceClient."""
     try:
         from azure.storage.blob import BlobServiceClient
     except ImportError:
@@ -419,17 +393,9 @@ def _azure_client(args):
 
 
 def azure_convert_file(
-    client,
-    container: str,
-    blob_name: str,
-    out_container: str,
-    out_prefix: str,
-    pfc_binary: str,
-    fmt: str = None,
-    verbose: bool = False,
-    delete_original: bool = False,
+    client, container, blob_name, out_container, out_prefix,
+    pfc_binary, fmt=None, verbose=False, delete_original=False,
 ) -> dict:
-    """Download one Azure blob, convert to PFC, upload back."""
     src_path = Path(blob_name)
     fmt = fmt or detect_format(src_path)
     if not fmt:
@@ -445,7 +411,6 @@ def azure_convert_file(
         tmp_input = Path(tmpdir) / src_path.name
         tmp_pfc   = Path(tmpdir) / out_name
 
-        # Download
         if verbose:
             print(f"     Downloading ...", end=" ", flush=True)
         blob_client = client.get_blob_client(container=container, blob=blob_name)
@@ -454,11 +419,9 @@ def azure_convert_file(
         if verbose:
             print(f"{tmp_input.stat().st_size/1_048_576:.1f} MB")
 
-        # Convert
-        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        stats  = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
         pfc_mb = tmp_pfc.stat().st_size / 1_048_576
 
-        # Upload .pfc
         if verbose:
             print(f"     Uploading  azure://{out_container}/{out_blob} ...", end=" ", flush=True)
         out_client = client.get_blob_client(container=out_container, blob=out_blob)
@@ -467,7 +430,6 @@ def azure_convert_file(
         if verbose:
             print(f"{pfc_mb:.1f} MB")
 
-        # Upload .bidx
         bidx_local = Path(str(tmp_pfc) + ".bidx")
         if bidx_local.exists():
             bidx_blob = out_blob + ".bidx"
@@ -490,7 +452,6 @@ def azure_convert_file(
 
 
 def cmd_azure(args, pfc_binary: str):
-    """Handle the `azure` subcommand."""
     client = _azure_client(args)
     out_container = getattr(args, "out_container", None) or args.container
     out_prefix    = getattr(args, "out_prefix", None)    or getattr(args, "prefix", "")
@@ -507,7 +468,7 @@ def cmd_azure(args, pfc_binary: str):
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
     else:
-        cc = client.get_container_client(args.container)
+        cc    = client.get_container_client(args.container)
         blobs = [b.name for b in cc.list_blobs(name_starts_with=args.prefix or "")]
         if args.format:
             blobs = [b for b in blobs if b.lower().endswith(f".{args.format}") or
@@ -534,11 +495,10 @@ def cmd_azure(args, pfc_binary: str):
 
 
 # ---------------------------------------------------------------------------
-# Google Cloud Storage support (Stage 3)
+# Google Cloud Storage support
 # ---------------------------------------------------------------------------
 
 def _gcs_client(args):
-    """Create GCS client."""
     try:
         from google.cloud import storage as gcs_mod
     except ImportError:
@@ -546,7 +506,6 @@ def _gcs_client(args):
         sys.exit(1)
     endpoint = getattr(args, "endpoint_url", None)
     if endpoint:
-        # Custom endpoint (fake-gcs-server)
         import requests
         from google.auth.credentials import AnonymousCredentials
         client = gcs_mod.Client(
@@ -554,30 +513,21 @@ def _gcs_client(args):
             project="test-project",
             client_options={"api_endpoint": endpoint},
         )
-        # Disable SSL verification for local emulator
         client._http.verify = False
         return client
     return gcs_mod.Client()
 
 
 def gcs_convert_file(
-    client,
-    bucket_name: str,
-    blob_name: str,
-    out_bucket_name: str,
-    out_prefix: str,
-    pfc_binary: str,
-    fmt: str = None,
-    verbose: bool = False,
-    delete_original: bool = False,
+    client, bucket_name, blob_name, out_bucket_name, out_prefix,
+    pfc_binary, fmt=None, verbose=False, delete_original=False,
 ) -> dict:
-    """Download one GCS object, convert to PFC, upload back."""
     src_path = Path(blob_name)
     fmt = fmt or detect_format(src_path)
     if not fmt:
         raise ValueError(f"Cannot detect format for '{blob_name}'. Use --format.")
 
-    out_name = output_path_for(src_path).name
+    out_name      = output_path_for(src_path).name
     out_blob_name = (out_prefix.rstrip("/") + "/" + out_name) if out_prefix else out_name
 
     if verbose:
@@ -587,7 +537,6 @@ def gcs_convert_file(
         tmp_input = Path(tmpdir) / src_path.name
         tmp_pfc   = Path(tmpdir) / out_name
 
-        # Download
         if verbose:
             print(f"     Downloading ...", end=" ", flush=True)
         bucket = client.bucket(bucket_name)
@@ -595,11 +544,9 @@ def gcs_convert_file(
         if verbose:
             print(f"{tmp_input.stat().st_size/1_048_576:.1f} MB")
 
-        # Convert
-        stats = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
+        stats  = convert_file(tmp_input, tmp_pfc, pfc_binary, fmt=fmt, verbose=False)
         pfc_mb = tmp_pfc.stat().st_size / 1_048_576
 
-        # Upload .pfc
         if verbose:
             print(f"     Uploading  gcs://{out_bucket_name}/{out_blob_name} ...", end=" ", flush=True)
         out_bucket = client.bucket(out_bucket_name)
@@ -607,7 +554,6 @@ def gcs_convert_file(
         if verbose:
             print(f"{pfc_mb:.1f} MB")
 
-        # Upload .bidx
         bidx_local = Path(str(tmp_pfc) + ".bidx")
         if bidx_local.exists():
             bidx_blob = out_blob_name + ".bidx"
@@ -628,8 +574,7 @@ def gcs_convert_file(
 
 
 def cmd_gcs(args, pfc_binary: str):
-    """Handle the `gcs` subcommand."""
-    client = _gcs_client(args)
+    client     = _gcs_client(args)
     out_bucket = getattr(args, "out_bucket", None) or args.bucket
     out_prefix = getattr(args, "out_prefix", None) or getattr(args, "prefix", "")
 
@@ -645,7 +590,6 @@ def cmd_gcs(args, pfc_binary: str):
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
     else:
-        bucket = client.bucket(args.bucket)
         blobs = [b.name for b in client.list_blobs(args.bucket, prefix=args.prefix or "")]
         if args.format:
             blobs = [b for b in blobs if b.lower().endswith(f".{args.format}") or
@@ -671,98 +615,141 @@ def cmd_gcs(args, pfc_binary: str):
         sys.exit(0 if failed == 0 else 1)
 
 
-def cmd_s3(args, pfc_binary: str):
-    """Handle the `s3` subcommand."""
-    s3 = _s3_client(args)
+# ---------------------------------------------------------------------------
+# Public Storage API  (importable by pfc-convert, pfc-ingest-watchdog)
+# ---------------------------------------------------------------------------
+# Usage:
+#   from pfc_migrate import get_s3_client, upload_pfc_to_s3
+#   s3 = get_s3_client(region="eu-central-1")
+#   upload_pfc_to_s3(s3, Path("archive.pfc"), bucket="my-bucket", key="pfc/archive.pfc")
 
+def get_s3_client(region=None, endpoint_url=None, access_key=None, secret_key=None):
+    """Create a boto3 S3 client with explicit credentials."""
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError("pip install boto3  (required for S3 support)")
+    kwargs = {}
+    if region:
+        kwargs["region_name"] = region
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    if access_key:
+        kwargs["aws_access_key_id"]     = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+    return boto3.client("s3", **kwargs)
+
+
+def get_azure_client(connection_string=None, account_url=None):
+    """Create an Azure BlobServiceClient."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError:
+        raise ImportError("pip install azure-storage-blob  (required for Azure support)")
+    if connection_string:
+        return BlobServiceClient.from_connection_string(connection_string)
+    if account_url:
+        return BlobServiceClient(account_url=account_url)
+    raise ValueError("Provide connection_string or account_url for Azure.")
+
+
+def get_gcs_client(endpoint_url=None):
+    """Create a Google Cloud Storage client."""
+    try:
+        from google.cloud import storage as gcs_mod
+    except ImportError:
+        raise ImportError("pip install google-cloud-storage  (required for GCS support)")
+    if endpoint_url:
+        import requests
+        from google.auth.credentials import AnonymousCredentials
+        client = gcs_mod.Client(
+            credentials=AnonymousCredentials(),
+            project="test-project",
+            client_options={"api_endpoint": endpoint_url},
+        )
+        client._http.verify = False
+        return client
+    return gcs_mod.Client()
+
+
+def upload_pfc_to_s3(s3, pfc_path, bucket: str, key: str):
+    """Upload a .pfc file and its .bidx sidecar to S3."""
+    pfc_path = Path(pfc_path)
+    s3.upload_file(str(pfc_path), bucket, key)
+    bidx = Path(str(pfc_path) + ".bidx")
+    if bidx.exists():
+        s3.upload_file(str(bidx), bucket, key + ".bidx")
+
+
+# ---------------------------------------------------------------------------
+
+
+def cmd_s3(args, pfc_binary: str):
+    s3         = _s3_client(args)
     out_bucket = args.out_bucket or args.bucket
     out_prefix = args.out_prefix or args.prefix
 
     if args.key:
-        # Single object
         try:
             s3_convert_file(
                 s3, args.bucket, args.key,
                 out_bucket, out_prefix,
                 pfc_binary, fmt=args.format,
-                verbose=True,
-                delete_original=args.delete,
+                verbose=True, delete_original=args.delete,
             )
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
-
     else:
-        # Batch: all objects under prefix
         print(f"Listing s3://{args.bucket}/{args.prefix} ...")
         keys = s3_list_objects(s3, args.bucket, args.prefix)
-
-        # Filter by format extension if specified
         if args.format:
-            ext = f".jsonl.{args.format}"
+            ext  = f".jsonl.{args.format}"
             keys = [k for k in keys if k.lower().endswith(ext) or k.lower().endswith(f".{args.format}")]
-
         if not keys:
             print("No matching objects found.")
             sys.exit(0)
-
         print(f"Found {len(keys)} object(s) to convert\n")
         success = failed = 0
-
         for key in keys:
             try:
                 s3_convert_file(
                     s3, args.bucket, key,
                     out_bucket, out_prefix,
                     pfc_binary, fmt=args.format,
-                    verbose=args.verbose,
-                    delete_original=args.delete,
+                    verbose=args.verbose, delete_original=args.delete,
                 )
                 success += 1
             except Exception as exc:
                 print(f"  ERROR {key}: {exc}", file=sys.stderr)
                 failed += 1
-
         print(f"\nDone: {success} converted, {failed} failed")
         sys.exit(0 if failed == 0 else 1)
 
 
 def cmd_glacier(args, pfc_binary: str):
-    """
-    Handle `glacier` subcommand.
-
-    Glacier objects must be restored before download.
-    This command:
-      1. Initiates restore for all matching objects (if not already restored)
-      2. Waits (or exits with status if still restoring)
-      3. Converts all restored objects to PFC
-    """
     s3 = _s3_client(args)
 
     print(f"Listing s3://{args.bucket}/{args.prefix} ...")
     keys = s3_list_objects(s3, args.bucket, args.prefix)
     if args.format:
-        ext = f".{args.format}"
-        keys = [k for k in keys if k.lower().endswith(ext)]
-
+        keys = [k for k in keys if k.lower().endswith(f".{args.format}")]
     if not keys:
         print("No matching objects found.")
         sys.exit(0)
 
     print(f"Found {len(keys)} object(s)\n")
-
     restoring = []
     ready     = []
     failed_r  = []
 
     for key in keys:
         try:
-            head = s3.head_object(Bucket=args.bucket, Key=key)
+            head    = s3.head_object(Bucket=args.bucket, Key=key)
             restore = head.get("Restore", "")
             storage = head.get("StorageClass", "STANDARD")
 
             if storage not in ("GLACIER", "DEEP_ARCHIVE", "GLACIER_IR"):
-                # Not in Glacier — treat as normal S3
                 ready.append(key)
                 continue
 
@@ -773,18 +760,15 @@ def cmd_glacier(args, pfc_binary: str):
                 print(f"  ✅ READY    : {key}")
                 ready.append(key)
             else:
-                # Not yet initiated — start restore
                 print(f"  🔄 INITIATING restore: {key}")
                 s3.restore_object(
-                    Bucket=args.bucket,
-                    Key=key,
+                    Bucket=args.bucket, Key=key,
                     RestoreRequest={
                         "Days": args.days,
                         "GlacierJobParameters": {"Tier": args.tier.capitalize()},
                     },
                 )
                 restoring.append(key)
-
         except Exception as exc:
             print(f"  ❌ ERROR {key}: {exc}")
             failed_r.append(key)
@@ -801,13 +785,12 @@ def cmd_glacier(args, pfc_binary: str):
             f"\n   Re-run this command later to convert when ready.\n"
         )
         if not ready:
-            sys.exit(2)  # exit 2 = still waiting (not an error)
+            sys.exit(2)
 
     if not ready:
         print("No objects ready to convert.")
         sys.exit(0)
 
-    # Convert ready objects
     out_bucket = args.out_bucket or args.bucket
     out_prefix = args.out_prefix or args.prefix
     success = failed = 0
@@ -818,8 +801,7 @@ def cmd_glacier(args, pfc_binary: str):
                 s3, args.bucket, key,
                 out_bucket, out_prefix,
                 pfc_binary, fmt=args.format,
-                verbose=args.verbose,
-                delete_original=args.delete,
+                verbose=args.verbose, delete_original=args.delete,
             )
             success += 1
         except Exception as exc:
@@ -831,257 +813,8 @@ def cmd_glacier(args, pfc_binary: str):
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 — PostgreSQL wire protocol export
-# Supports: CrateDB (port 5432), QuestDB (port 8812)
-# ---------------------------------------------------------------------------
-
-def _pg_wire_export_to_pfc(
-    host: str,
-    port: int,
-    user: str,
-    password: str,
-    dbname: str,
-    table: str,
-    output_path: Path,
-    pfc_binary: str,
-    schema: str = None,
-    ts_column: str = None,
-    from_ts: str = None,
-    to_ts: str = None,
-    batch_size: int = 10_000,
-    db_label: str = "DB",
-    verbose: bool = False,
-) -> dict:
-    """
-    Stream rows from any PostgreSQL-wire-protocol database into a PFC archive.
-
-    Supports CrateDB, TimescaleDB, QuestDB — all via psycopg2.
-    Uses fetchmany() batching (memory-safe). Named server-side cursors are NOT
-    used: CrateDB and QuestDB don't support them outside of transactions.
-
-    Flow:
-      DB  →  fetchmany(batch_size) loop  →  JSONL temp file
-          →  pfc_jsonl compress  →  output.pfc + output.pfc.bidx
-
-    Returns a dict with: rows, jsonl_mb, output_mb, ratio_pct, output
-    """
-    try:
-        import psycopg2
-    except ImportError:
-        raise ImportError(
-            "psycopg2 is required for database export.\n"
-            "Install it: pip install psycopg2-binary"
-        )
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Build table reference — schema is optional (QuestDB has none)
-    full_table = f'"{schema}"."{table}"' if schema else f'"{table}"'
-
-    # Optional time-range filter
-    conditions, params = [], []
-    if ts_column and from_ts:
-        conditions.append(f'"{ts_column}" >= %s')
-        params.append(from_ts)
-    if ts_column and to_ts:
-        conditions.append(f'"{ts_column}" < %s')
-        params.append(to_ts)
-
-    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    order_clause = (f'ORDER BY "{ts_column}"') if ts_column else ""
-    query        = f"SELECT * FROM {full_table} {where_clause} {order_clause}".strip()
-
-    if verbose:
-        print(f"  → Connecting to {db_label} at {host}:{port} (db: {dbname}) ...")
-        print(f"  → Query: {query[:120]}{'...' if len(query) > 120 else ''}")
-
-    conn = psycopg2.connect(
-        host=host, port=port, user=user, password=password,
-        dbname=dbname, connect_timeout=30,
-    )
-    conn.autocommit = True
-
-    tmp_fd, tmp_jsonl = tempfile.mkstemp(
-        suffix=".jsonl",
-        prefix=f"pfc_{db_label.lower().replace(' ', '_')}_",
-    )
-    os.close(tmp_fd)
-
-    row_count   = 0
-    jsonl_bytes = 0
-
-    try:
-        cur = conn.cursor()
-        cur.execute(query, params or None)
-
-        col_names = [desc[0] for desc in cur.description]
-
-        if verbose:
-            print(f"  → Columns ({len(col_names)}): {', '.join(col_names[:8])}"
-                  f"{'...' if len(col_names) > 8 else ''}")
-            print(f"  → Streaming rows (batch size: {batch_size:,}) ...")
-
-        with open(tmp_jsonl, "w", encoding="utf-8") as fout:
-            while True:
-                batch = cur.fetchmany(batch_size)
-                if not batch:
-                    break
-
-                for raw_row in batch:
-                    row_dict = {}
-                    for col, val in zip(col_names, raw_row):
-                        if isinstance(val, datetime):
-                            val = val.isoformat()
-                        elif isinstance(val, bytes):
-                            val = val.hex()
-                        row_dict[col] = val
-
-                    # Ensure pfc_jsonl can build its timestamp index.
-                    # pfc_jsonl recognises "timestamp" and "@timestamp" — not
-                    # arbitrary column names.  We add "timestamp" as an alias
-                    # so time-range queries (pfc_jsonl query / s3-fetch --from
-                    # --to) work regardless of what the CrateDB column is called.
-                    if ts_column and ts_column in row_dict and "timestamp" not in row_dict:
-                        row_dict["timestamp"] = row_dict[ts_column]
-
-                    line = json.dumps(row_dict, ensure_ascii=False) + "\n"
-                    fout.write(line)
-                    jsonl_bytes += len(line.encode("utf-8"))
-                    row_count   += 1
-
-                if verbose and row_count % 100_000 == 0:
-                    print(f"     {row_count:,} rows  ({jsonl_bytes / 1_048_576:.1f} MiB) ...")
-
-        cur.close()
-
-        if verbose:
-            print(f"  → Exported {row_count:,} rows  ({jsonl_bytes / 1_048_576:.1f} MiB JSONL)")
-            print(f"  → Compressing with pfc_jsonl ...")
-
-        proc = subprocess.run(
-            [pfc_binary, "compress", tmp_jsonl, str(output_path)],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"pfc_jsonl compress failed (exit {proc.returncode}):\n"
-                f"{proc.stderr.strip()}"
-            )
-
-        jsonl_mb  = jsonl_bytes / 1_048_576
-        output_mb = output_path.stat().st_size / 1_048_576
-        ratio_pct = (output_mb / jsonl_mb * 100) if jsonl_mb > 0 else 0.0
-
-        if verbose:
-            print(
-                f"  ✓ {row_count:,} rows  |  "
-                f"JSONL {jsonl_mb:.1f} MiB  →  PFC {output_mb:.1f} MiB  "
-                f"({ratio_pct:.1f}%)  →  {output_path.name}"
-            )
-
-        return {
-            "rows":      row_count,
-            "jsonl_mb":  jsonl_mb,
-            "output_mb": output_mb,
-            "ratio_pct": ratio_pct,
-            "output":    str(output_path),
-        }
-
-    except Exception:
-        conn.close()
-        raise
-    finally:
-        if os.path.exists(tmp_jsonl):
-            os.unlink(tmp_jsonl)
-
-
-def _cmd_pg_wire(args, pfc_binary: str, db_label: str):
-    """Generic handler for all PostgreSQL wire protocol DB export subcommands."""
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        parts = [args.table]
-        if args.from_ts:
-            parts.append(args.from_ts.replace(":", "").replace("-", "").replace(" ", "T")[:15])
-        if args.to_ts:
-            parts.append(args.to_ts.replace(":", "").replace("-", "").replace(" ", "T")[:15])
-        output_path = Path("_".join(parts) + ".pfc")
-
-    try:
-        stats = _pg_wire_export_to_pfc(
-            host=args.host,
-            port=args.port,
-            user=args.user,
-            password=args.password,
-            dbname=args.dbname,
-            table=args.table,
-            output_path=output_path,
-            pfc_binary=pfc_binary,
-            schema=getattr(args, "schema", None) or None,
-            ts_column=args.ts_column,
-            from_ts=args.from_ts,
-            to_ts=args.to_ts,
-            batch_size=args.batch_size,
-            db_label=db_label,
-            verbose=args.verbose,
-        )
-        if not args.verbose:
-            print(
-                f"Done: {stats['rows']:,} rows  →  {stats['output']}  "
-                f"({stats['ratio_pct']:.1f}% of JSONL)"
-            )
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-
-def cmd_cratedb(args, pfc_binary: str):
-    """Handle the `cratedb` subcommand."""
-    _cmd_pg_wire(args, pfc_binary, db_label="CrateDB")
-
-
-def cmd_questdb(args, pfc_binary: str):
-    """Handle the `questdb` subcommand."""
-    _cmd_pg_wire(args, pfc_binary, db_label="QuestDB")
-
-
 # CLI
 # ---------------------------------------------------------------------------
-
-def _add_pg_wire_args(p, name, default_port, default_user, default_password,
-                      default_dbname, default_schema, example_host):
-    """Add shared CLI arguments for all PostgreSQL wire protocol subcommands."""
-    p.add_argument("--host",       required=True,
-                   help=f"{name} hostname or IP")
-    p.add_argument("--port",       type=int, default=default_port,
-                   help=f"PostgreSQL port (default: {default_port})")
-    p.add_argument("--user",       default=default_user,
-                   help=f"Username (default: {default_user})")
-    p.add_argument("--password",   default=default_password,
-                   help=f"Password (default: {repr(default_password) if default_password else 'empty'})")
-    p.add_argument("--dbname",     default=default_dbname,
-                   help=f"Database name (default: {default_dbname})")
-    if default_schema is not None:            # QuestDB has no schema concept
-        p.add_argument("--schema", default=default_schema,
-                       help=f"Schema (default: {default_schema})")
-    p.add_argument("--table",      required=True,
-                   help="Table name to export")
-    p.add_argument("--ts-column",  default=None, metavar="COL",
-                   help="Timestamp column for time-range filtering and ORDER BY")
-    p.add_argument("--from-ts",    default=None, metavar="ISO_DATETIME",
-                   help="Start of time range (ISO 8601, inclusive). Requires --ts-column.")
-    p.add_argument("--to-ts",      default=None, metavar="ISO_DATETIME",
-                   help="End of time range (ISO 8601, exclusive). Requires --ts-column.")
-    p.add_argument("--output",     default=None, metavar="FILE",
-                   help="Output .pfc file (default: {table}.pfc or {table}_{from}_{to}.pfc)")
-    p.add_argument("--batch-size", type=int, default=10_000, metavar="N",
-                   help="Rows per fetch batch (default: 10,000)")
-    p.add_argument("--verbose", "-v", action="store_true",
-                   help="Show row progress and size stats")
-    p.add_argument("--pfc-binary", default=None, metavar="PATH",
-                   help="Path to pfc_jsonl binary (default: auto-detect)")
-
 
 def _add_common(parser):
     parser.add_argument(
@@ -1110,151 +843,102 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Single file
   pfc-migrate convert logs.jsonl.gz logs.pfc
-
-  # Auto-detect output name
-  pfc-migrate convert logs.jsonl.zst
-
-  # Whole directory
   pfc-migrate convert --dir /var/log/archive/ --output-dir /var/log/pfc/
-
-  # Recursive, force format, verbose
   pfc-migrate convert --dir /mnt/logs/ --format gz -r -v
+  pfc-migrate s3 --bucket my-bucket --prefix logs/2025/
+  pfc-migrate azure --container my-container --blob logs.jsonl.gz
+  pfc-migrate gcs --bucket my-bucket --blob logs/app.jsonl.zst
 
 Install pfc_jsonl binary first:
   curl -L https://github.com/ImpossibleForge/pfc-jsonl/releases/latest/download/pfc_jsonl-linux-x64 \\
        -o /usr/local/bin/pfc_jsonl && chmod +x /usr/local/bin/pfc_jsonl
+
+For database export (CrateDB, QuestDB, etc.) use the dedicated tools:
+  pip install pfc-export-cratedb   # https://github.com/ImpossibleForge/pfc-export-cratedb
+  pip install pfc-export-questdb   # https://github.com/ImpossibleForge/pfc-export-questdb
         """,
     )
 
-    parser.add_argument(
-        "--version", action="version", version=f"pfc-migrate {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"pfc-migrate {__version__}")
 
     sub = parser.add_subparsers(dest="command")
 
-    # ---- convert (Stage 1 — local) ----
+    # ---- convert (local files) ----
     conv = sub.add_parser("convert", help="Convert compressed JSONL to PFC (local files)")
     conv.add_argument("input",  nargs="?", help="Input file")
     conv.add_argument("output", nargs="?", help="Output .pfc file (optional, auto-generated if omitted)")
+    conv.add_argument("--out",        metavar="PATH", help="Output .pfc file (alternative to positional; required with --stdin)")
     conv.add_argument("--dir",        metavar="DIR",  help="Convert all JSONL archives in DIR")
     conv.add_argument("--output-dir", metavar="DIR",  help="Output directory (used with --dir)")
     conv.add_argument("--recursive", "-r", action="store_true", help="Recurse into subdirectories")
+    conv.add_argument("--stdin",      action="store_true",
+                      help="Read JSONL from stdin and compress to .pfc (pipe mode: pfc-convert --stdout | pfc-migrate convert --stdin --out out.pfc)")
     _add_common(conv)
 
-    # ---- azure (Stage 3 — Azure Blob Storage) ----
+    # ---- azure ----
     def _add_azure_common(p):
-        p.add_argument("--container",         required=True, help="Source container name")
-        p.add_argument("--blob",              default=None,  help="Single blob name (omit for batch)")
-        p.add_argument("--prefix",            default="",    help="Blob prefix for batch mode")
-        p.add_argument("--out-container",     default=None,  help="Destination container (default: same)")
-        p.add_argument("--out-prefix",        default=None,  help="Destination prefix")
-        p.add_argument("--connection-string", default=None,  help="Azure Storage connection string")
-        p.add_argument("--account-url",       default=None,  help="Azure Storage account URL")
-        p.add_argument("--delete",            action="store_true", help="Delete original blob after conversion")
+        p.add_argument("--container",         required=True)
+        p.add_argument("--blob",              default=None)
+        p.add_argument("--prefix",            default="")
+        p.add_argument("--out-container",     default=None)
+        p.add_argument("--out-prefix",        default=None)
+        p.add_argument("--connection-string", default=None)
+        p.add_argument("--account-url",       default=None)
+        p.add_argument("--delete",            action="store_true")
         _add_common(p)
 
     azp = sub.add_parser("azure", help="Convert Azure Blob Storage objects (gzip/zstd/bzip2/lz4 -> pfc)")
     _add_azure_common(azp)
 
-    # ---- gcs (Stage 3 — Google Cloud Storage) ----
+    # ---- gcs ----
     def _add_gcs_common(p):
-        p.add_argument("--bucket",       required=True, help="Source GCS bucket name")
-        p.add_argument("--blob",         default=None,  help="Single object name (omit for batch)")
-        p.add_argument("--prefix",       default="",    help="Object prefix for batch mode")
-        p.add_argument("--out-bucket",   default=None,  help="Destination bucket (default: same)")
-        p.add_argument("--out-prefix",   default=None,  help="Destination prefix")
-        p.add_argument("--endpoint-url", default=None,  help="Custom GCS endpoint (e.g. fake-gcs: http://localhost:4443)")
-        p.add_argument("--delete",       action="store_true", help="Delete original object after conversion")
+        p.add_argument("--bucket",       required=True)
+        p.add_argument("--blob",         default=None)
+        p.add_argument("--prefix",       default="")
+        p.add_argument("--out-bucket",   default=None)
+        p.add_argument("--out-prefix",   default=None)
+        p.add_argument("--endpoint-url", default=None)
+        p.add_argument("--delete",       action="store_true")
         _add_common(p)
 
     gcsp = sub.add_parser("gcs", help="Convert Google Cloud Storage objects (gzip/zstd/bzip2/lz4 -> pfc)")
     _add_gcs_common(gcsp)
 
-    # ---- s3 (Stage 2 — Amazon S3) ----
+    # ---- s3 ----
     def _add_s3_common(p):
-        p.add_argument("--bucket",      required=True, help="Source S3 bucket name")
-        p.add_argument("--key",         default=None,  help="Single object key (omit for batch)")
-        p.add_argument("--prefix",      default="",    help="Object prefix for batch mode")
-        p.add_argument("--out-bucket",  default=None,  help="Destination bucket (default: same as source)")
-        p.add_argument("--out-prefix",  default=None,  help="Destination prefix (default: same as source prefix)")
-        p.add_argument("--region",      default="us-east-1", help="AWS region (default: us-east-1)")
-        p.add_argument("--endpoint-url",default=None,  help="Custom S3 endpoint (e.g. MinIO: http://localhost:9000)")
-        p.add_argument("--access-key",  default=None,  help="AWS access key (default: from env/~/.aws)")
-        p.add_argument("--secret-key",  default=None,  help="AWS secret key")
-        p.add_argument("--delete",      action="store_true", help="Delete original object after conversion")
+        p.add_argument("--bucket",       required=True)
+        p.add_argument("--key",          default=None)
+        p.add_argument("--prefix",       default="")
+        p.add_argument("--out-bucket",   default=None)
+        p.add_argument("--out-prefix",   default=None)
+        p.add_argument("--region",       default="us-east-1")
+        p.add_argument("--endpoint-url", default=None)
+        p.add_argument("--access-key",   default=None)
+        p.add_argument("--secret-key",   default=None)
+        p.add_argument("--delete",       action="store_true")
         _add_common(p)
 
     s3p = sub.add_parser("s3", help="Convert S3 objects (gzip/zstd/bzip2/lz4 -> pfc) in-place")
     _add_s3_common(s3p)
 
-    # ---- glacier (Stage 2 — S3 Glacier) ----
+    # ---- glacier ----
     glp = sub.add_parser("glacier", help="Restore + convert S3 Glacier objects to PFC")
     _add_s3_common(glp)
-    glp.add_argument("--tier",  default="standard",
-                     choices=["standard", "expedited", "bulk"],
-                     help="Glacier retrieval tier (default: standard = 3-5h)")
-    glp.add_argument("--days",  type=int, default=3,
-                     help="Days to keep restored copy available (default: 3)")
-
-    # ---- cratedb (Stage 4a) ----
-    crdb = sub.add_parser(
-        "cratedb",
-        help="Export CrateDB table -> PFC archive (PostgreSQL wire protocol, port 5432)",
-        description=(
-            "Stream rows from a CrateDB table into a PFC cold-storage archive.\n"
-            "CrateDB default port: 5432  |  Requires: pip install psycopg2-binary"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  pfc-migrate cratedb --host crate.example.com --table logs --output logs.pfc
-  pfc-migrate cratedb --host crate.example.com --table events \\
-    --ts-column timestamp --from-ts "2024-01-01T00:00:00" --to-ts "2024-02-01T00:00:00" \\
-    --output events_jan2024.pfc --verbose
-        """,
-    )
-    _add_pg_wire_args(crdb, "CrateDB",
-                      default_port=5432, default_user="crate",
-                      default_password="",   default_dbname="doc",
-                      default_schema="doc",  example_host="crate.example.com")
-
-    # ---- questdb (Stage 4b) ----
-    qdp = sub.add_parser(
-        "questdb",
-        help="Export QuestDB table -> PFC archive (PostgreSQL wire protocol, port 8812)",
-        description=(
-            "Stream rows from a QuestDB table into a PFC cold-storage archive.\n"
-            "QuestDB default port: 8812  |  Requires: pip install psycopg2-binary\n"
-            "Note: QuestDB has no schema concept — tables are referenced by name only."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  pfc-migrate questdb --host quest.example.com --table trades --output trades.pfc
-  pfc-migrate questdb --host quest.example.com --table sensor_data \\
-    --ts-column timestamp --from-ts "2024-01-01T00:00:00" --to-ts "2024-02-01T00:00:00" \\
-    --output sensor_jan2024.pfc --verbose
-        """,
-    )
-    _add_pg_wire_args(qdp, "QuestDB",
-                      default_port=8812, default_user="admin",
-                      default_password="quest", default_dbname="qdb",
-                      default_schema=None,       example_host="quest.example.com")
+    glp.add_argument("--tier", default="standard", choices=["standard", "expedited", "bulk"])
+    glp.add_argument("--days", type=int, default=3)
 
     return parser
 
 
 def main():
     parser = build_parser()
-    args = parser.parse_args()
+    args   = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    # Locate binary
     try:
         pfc_binary = find_pfc_binary(getattr(args, "pfc_binary", None))
     except FileNotFoundError as exc:
@@ -1264,44 +948,43 @@ def main():
     if not pfc_binary:
         print(
             "ERROR: pfc_jsonl binary not found.\n"
-            "Install it with:\n"
-            "  curl -L https://github.com/ImpossibleForge/pfc-jsonl/releases/latest/"
+            "Install: curl -L https://github.com/ImpossibleForge/pfc-jsonl/releases/latest/"
             "download/pfc_jsonl-linux-x64 -o /usr/local/bin/pfc_jsonl && "
             "chmod +x /usr/local/bin/pfc_jsonl",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # ---- s3 command ----
     if args.command == "s3":
         cmd_s3(args, pfc_binary)
-        return
-
-    # ---- glacier command ----
-    if args.command == "glacier":
+    elif args.command == "glacier":
         cmd_glacier(args, pfc_binary)
-        return
-
-    # ---- azure command ----
-    if args.command == "azure":
+    elif args.command == "azure":
         cmd_azure(args, pfc_binary)
-        return
-
-    # ---- gcs command ----
-    if args.command == "gcs":
+    elif args.command == "gcs":
         cmd_gcs(args, pfc_binary)
-        return
-
-    # ---- Stage 4: PostgreSQL wire protocol ----
-    if args.command == "cratedb":
-        cmd_cratedb(args, pfc_binary)
-        return
-    if args.command == "questdb":
-        cmd_questdb(args, pfc_binary)
-        return
-    if args.command == "convert":
-
-        if args.dir:
+    elif args.command == "convert":
+        if getattr(args, "stdin", False):
+            # --stdin: positional arg (args.input) is treated as output path
+            out_path = getattr(args, "out", None) or args.output or args.input
+            if not out_path:
+                print("ERROR: --stdin requires --out <output.pfc>", file=sys.stderr)
+                sys.exit(1)
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jsonl")
+            try:
+                with os.fdopen(tmp_fd, "wb") as f:
+                    shutil.copyfileobj(sys.stdin.buffer, f)
+                stats = convert_file(tmp_path, out_path, pfc_binary,
+                                     fmt="plain", verbose=args.verbose)
+                if not args.verbose:
+                    print(f"Done: {out_path}  ({stats['ratio_pct']:.1f}% of input)")
+            except Exception as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        elif args.dir:
             success, failed = convert_dir(
                 args.dir,
                 output_dir=args.output_dir,
@@ -1311,24 +994,17 @@ def main():
                 recursive=args.recursive,
             )
             sys.exit(0 if failed == 0 else 1)
-
         elif args.input:
-            output = args.output or str(output_path_for(Path(args.input)))
+            output = getattr(args, "out", None) or args.output or str(output_path_for(Path(args.input)))
             try:
-                stats = convert_file(
-                    args.input, output, pfc_binary,
-                    fmt=args.format, verbose=args.verbose,
-                )
+                stats = convert_file(args.input, output, pfc_binary, fmt=args.format, verbose=args.verbose)
                 if not args.verbose:
-                    ratio = stats["ratio_pct"]
-                    print(f"Done: {output}  ({ratio:.1f}% of input)")
+                    print(f"Done: {output}  ({stats['ratio_pct']:.1f}% of input)")
             except Exception as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 sys.exit(1)
-
         else:
-            conv_parser = build_parser()._subparsers._actions[-1].choices["convert"]
-            conv_parser.print_help()
+            build_parser()._subparsers._actions[-1].choices["convert"].print_help()
             sys.exit(1)
 
 

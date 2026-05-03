@@ -1,0 +1,18 @@
+pfc-migrate v2.1.0
+==================
+Status:  LOKAL FERTIG — Push ausstehend (Wochenende 2026-04-29)
+Datum:   2026-04-29
+
+Änderungen vs v2.0.0:
+  - NEU: --stdin flag für convert subcommand (Pipe-Modus mit pfc-convert)
+  - NEU: --out flag für convert subcommand (Alternative zu positivem output-Argument)
+  - NEU: Public Storage API (get_s3_client, get_azure_client, get_gcs_client, upload_pfc_to_s3)
+         Importierbar von pfc-convert und pfc-ingest-watchdog
+  - README: Hinweis auf pfc-convert für Schema-Konvertierung (Apache CLF, CSV)
+
+Änderungen vs v1.2.0 (v2.0.0 Basis):
+  - DB-Export Subcommands entfernt (cratedb, questdb, timescaledb, ...)
+  - Fokus: Format-Konverter (gzip/bz2/zstd/lz4 → .pfc) über local/S3/Azure/GCS/Glacier
+  - DB-Export jetzt in separaten Tools: pfc-export-cratedb, pfc-export-questdb
+
+Backup: pfc_migrate_v1.2.0_backup.py (im selben Ordner)
