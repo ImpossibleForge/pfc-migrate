@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/badge/PyPI-pfc--migrate-blue.svg)](https://pypi.org/project/pfc-migrate/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
-[![PFC-JSONL](https://img.shields.io/badge/PFC--JSONL-v3.4-green.svg)](https://github.com/ImpossibleForge/pfc-jsonl)
+[![PFC-JSONL](https://img.shields.io/badge/PFC--JSONL-green.svg)](https://github.com/ImpossibleForge/pfc-jsonl)
 [![Version](https://img.shields.io/badge/pfc--migrate-v2.1.0-brightgreen.svg)](https://github.com/ImpossibleForge/pfc-migrate/releases)
 
 Convert existing compressed JSONL archives from local disk, S3, Azure, or GCS to PFC format. No intermediate files, no schema changes, no pipelines.
